@@ -21,12 +21,16 @@ def save_payload(data):
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
         json.dump(all_data, f, ensure_ascii=False, indent=2)
 
-@app.route('/webflow-webhook', methods=['POST'])
+@app.route('/webflow-webhook', methods=['GET', 'POST'])
 def webflow_webhook():
-    data = request.json
-    print("🔔 Webhook recebido:", data)
-    save_payload(data)
-    return jsonify({"status": "OK"}), 200
+    if request.method == 'POST':
+        data = request.json
+        print("🔔 Webhook recebido:", data)
+        save_payload(data)
+        return jsonify({"status": "OK"}), 200
+
+    # Se for GET, só responde status
+    return '✅ Endpoint online! Use método POST para enviar dados.', 200
 
 @app.route('/', methods=['GET'])
 def index():

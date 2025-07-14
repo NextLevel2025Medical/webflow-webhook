@@ -1,3 +1,4 @@
+# === IMPORTS ===
 import time
 import os
 import json
@@ -6,9 +7,9 @@ import logging
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from datetime import datetime, timedelta
-from selenium.webdriver.chrome.options import Options
 import subprocess
 import sys
+from shutil import which
 
 # === LOGGER GLOBAL ===
 LOG_DIR = "logs"
@@ -26,6 +27,31 @@ restart_count = int(os.environ.get("RESTART_COUNT", 0))
 AVG_SECONDS_PER_QUERY = 6
 
 resultado_dicionario = {}
+
+# === HEADLESS SETUP ===
+def iniciar_driver_headless():
+    from selenium.webdriver.chrome.options import Options
+
+    if not which("google-chrome") and not which("chromium"):
+        logger.error("❌ Chrome não está instalado no sistema.")
+        sys.exit(1)
+
+    options = Options()
+    options.add_argument('--headless')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--window-size=1920,1080')
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    options.binary_location = "/usr/bin/google-chrome"
+
+    try:
+        driver = webdriver.Chrome(options=options)
+        logger.info("✅ Navegador iniciado com sucesso (headless).")
+        return driver
+    except Exception as e:
+        logger.exception("❌ Erro ao iniciar o ChromeDriver.")
+        sys.exit(1)
 
 def salvar_resultados():
     try:
@@ -93,15 +119,7 @@ try:
         logger.error("⚠️ Argumentos insuficientes. Abortando subprocesso.")
         sys.exit(1)
 
-    options = Options()
-    options.add_argument('--headless')
-    options.add_argument('--no-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    options.add_argument('--disable-gpu')
-    options.add_argument('--window-size=1920,1080')
-    driver = webdriver.Chrome(options=options)
-    driver.maximize_window()
-    logger.info("🧭 Navegador iniciado")
+    driver = iniciar_driver_headless()
 
     url = "https://www.cirurgiaplastica.org.br/encontre-um-cirurgiao/#busca-cirurgiao"
 
@@ -186,6 +204,6 @@ except Exception as fatal:
 finally:
     try:
         driver.quit()
-        logger.info("🧨 Navegador fechado.")
+        logger.info("🧨 Chrome fechado.")
     except:
         pass

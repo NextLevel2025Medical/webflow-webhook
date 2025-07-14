@@ -7,16 +7,13 @@ from datetime import datetime
 import logging
 from logging.handlers import RotatingFileHandler
 
-# === Setup pasta e logger ===
+# === CONFIGURAÇÃO DE PASTAS ===
 app = Flask(__name__)
 OUTPUT_FILE = 'webflow_payloads.json'
-TEMP_DIR = 'temp_consultas'
 LOG_DIR = 'logs'
-
 os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(TEMP_DIR, exist_ok=True)
 
-# === Logger configurado ===
+# === CONFIGURAÇÃO DO LOGGER CENTRAL ===
 LOG_FILE = os.path.join(LOG_DIR, "log_geral.log")
 logger = logging.getLogger("webhook_logger")
 logger.setLevel(logging.INFO)
@@ -27,6 +24,7 @@ if not logger.handlers:
     handler.setFormatter(formatter)
     logger.addHandler(handler)
 
+# === SALVA PAYLOAD RECEBIDO ===
 def save_payload(data):
     if os.path.exists(OUTPUT_FILE):
         with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
@@ -41,48 +39,45 @@ def save_payload(data):
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
         json.dump(all_data, f, ensure_ascii=False, indent=2)
 
+# === ROTA PRINCIPAL DO WEBHOOK ===
 @app.route('/webflow-webhook', methods=['POST'])
 def webflow_webhook():
     data = request.json
-    logger.info("🔔 Webhook recebido")
+    logger.info("🔔 Webhook recebido.")
 
     save_payload(data)
 
     usuario = data.get("event", {}).get("usuario", {})
-    nome = usuario.get("nome")
+    nome = usuario.get("nome", "").strip()
     id_usuario = usuario.get("id")
-    telefone = usuario.get("celular")
-    email = usuario.get("email")
+    telefone = usuario.get("celular", "")
+    email = usuario.get("email", "")
     data_criacao = data.get("created_at", datetime.now().isoformat())
 
-    logger.info(f"📥 Dados extraídos: id={id_usuario}, nome={nome}, tel={telefone}, email={email}, criado_em={data_criacao}")
+    logger.info(f"📥 Extraído: id={id_usuario}, nome='{nome}', tel='{telefone}', email='{email}', criado_em='{data_criacao}'")
 
     if nome and id_usuario:
-        temp_file = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}.txt")
-        with open(temp_file, "w", encoding="utf-8") as f:
-            f.write("id;nome;telefone;email;data_criacao\n")
-            f.write(f"{id_usuario};{nome};{telefone};{email};{data_criacao}\n")
-
         log_individual = os.path.join(LOG_DIR, f"{id_usuario}_consulta.log")
-        logger.info(f"📂 Arquivo temporário salvo: {temp_file}")
-        logger.info(f"🚀 Iniciando subprocesso para {nome}")
+        logger.info(f"🚀 Chamando subprocesso para '{nome}' (ID {id_usuario})")
 
         try:
             subprocess.Popen(
-                ["python", "consulta_medicos.py", temp_file],
+                ["python", "consulta_medicos.py", str(id_usuario), nome, telefone or "", email or "", data_criacao],
                 stdout=open(log_individual, "w"),
                 stderr=subprocess.STDOUT
             )
         except Exception as e:
-            logger.error(f"❌ Falha ao iniciar subprocesso: {e}")
+            logger.error(f"❌ Erro ao iniciar subprocesso: {e}")
     else:
-        logger.warning("⚠️ Dados incompletos, não foi possível iniciar validação.")
+        logger.warning("⚠️ Dados insuficientes para iniciar subprocesso.")
 
     return jsonify({"status": "OK"}), 200
 
+# === HEALTH CHECK ===
 @app.route('/', methods=['GET'])
 def index():
     return '✅ API Online!', 200
 
+# === INICIAR SERVIDOR ===
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)

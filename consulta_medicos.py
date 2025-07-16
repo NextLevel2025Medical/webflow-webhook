@@ -101,10 +101,10 @@ try:
 
     if len(sys.argv) >= 6:
         id_usuario = int(sys.argv[1])
-        nome_busca = sys.argv[2]
-        telefone = sys.argv[3]
-        email = sys.argv[4]
-        data_criacao = sys.argv[5]
+        nome_busca = sys.argv[2].strip()
+        telefone = sys.argv[3].strip()
+        email = sys.argv[4].strip()
+        data_criacao = sys.argv[5].strip()
 
         logger.info(f"🚀 Modo individual: {nome_busca} (ID {id_usuario})")
 

@@ -24,28 +24,30 @@ def save_payload(data):
 @app.route('/webflow-webhook', methods=['POST'])
 def webflow_webhook():
     data = request.json
-    print("🔔 Webhook recebido:", data)
+    print("🔔 Webhook recebido:", data, flush=True)
 
     save_payload(data)
 
     try:
-        id_ = str(data.get('id', '')).strip()
-        nome = str(data.get('nome', '')).strip()
-        telefone = str(data.get('tel', '')).strip()
-        email = str(data.get('email', '')).strip()
-        criado_em = str(data.get('criado_em', '')).strip()
+        evento = data.get("event", {})
+
+        id_ = str(evento.get('id', '')).strip()
+        nome = str(evento.get('nome', '')).strip()
+        telefone = str(evento.get('celular', '')).strip()
+        email = str(evento.get('email', '')).strip()
+        criado_em = str(data.get('created_at', '')).strip()
 
         if all([id_, nome, telefone, email, criado_em]):
-            print(f"🚀 Chamando subprocesso para {nome} (ID {id_})")
+            print(f"🚀 Chamando subprocesso: {id_}, {nome}, {telefone}, {email}, {criado_em}", flush=True)
             subprocess.Popen([
                 'python3', 'consulta_medicos.py',
                 id_, nome, telefone, email, criado_em
             ])
         else:
-            print("⚠️ Dados incompletos. Subprocesso não iniciado.")
+            print("⚠️ Dados incompletos. Subprocesso não iniciado.", flush=True)
 
     except Exception as e:
-        print(f"❌ Erro ao iniciar subprocesso: {e}")
+        print(f"❌ Erro ao iniciar subprocesso: {e}", flush=True)
 
     return jsonify({"status": "OK"}), 200
 

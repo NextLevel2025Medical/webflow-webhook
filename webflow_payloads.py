@@ -31,6 +31,14 @@ def webflow_webhook():
     try:
         evento = data.get("event", {})
 
+        # Se o campo veio como string, transformar em dicionário
+        if isinstance(evento, str):
+            try:
+                evento = json.loads(evento.replace("'", '"'))  # substitui aspas simples por duplas
+            except Exception as e:
+                print("❌ Erro ao interpretar campo 'event' como JSON:", e, flush=True)
+                evento = {}
+
         id_ = str(evento.get('id', '')).strip()
         nome = str(evento.get('nome', '')).strip()
         telefone = str(evento.get('celular', '')).strip()

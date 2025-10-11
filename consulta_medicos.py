@@ -1,15 +1,33 @@
 # consulta_medicos.py
 # Playwright headless + fallback de instalação do Chromium em runtime.
 # Compatível com:
-#   - uso como função (import buscar_sbcp)
-#   - uso via CLI (imprime JSON no stdout para o worker consumir)
+#   - uso como função:   from consulta_medicos import buscar_sbcp
+#   - uso via CLI:       python consulta_medicos.py <member_id> "<nome>" "" "<email>" "<created_at>"
 #
-# Exemplo CLI:
-#   python consulta_medicos.py 1364 "GUSTAVO AQUINO" "" "dr@exemplo.com" "2025-10-11T00:00:00Z"
+# Saída (JSON no stdout quando usado via CLI):
+# {
+#   "status": "ok" | "not_found" | "error",
+#   "fonte": "sbcp",
+#   "reason": "...(se houver)...",
+#   "raw": {
+#       "member_id": 1364,
+#       "nome_busca": "GUSTAVO AQUINO",
+#       "email": "dr@exemplo.com",
+#       "qtd": 1,
+#       "resultados": [],
+#       "timing_ms": 2310,
+#       "tried_install": true,
+#       "debug": { "steps": ["...", "..."] }
+#       # opcional (descomentar no código onde indicado):
+#       # "screenshot_b64": "...."
+#   }
+# }
 
 import os
 import sys
+import re
 import json
+import base64
 import subprocess
 from time import perf_counter
 from typing import Dict, List, Optional
@@ -51,7 +69,10 @@ def _ensure_browser_once(steps: List[str]) -> bool:
 def buscar_sbcp(nome: str, email: str = "", steps: Optional[List[str]] = None) -> Dict:
     """
     1) Tenta abrir o Chromium. Se faltar binário, instala e tenta novamente (1x).
-    2) Abre a página, preenche o nome, clica em 'Buscar'.
+    2) Abre a página, preenche o nome, clica em 'Buscar' (ou equivalentes).
+       - tenta fechar banner de cookies
+       - procura botão em página raiz e iframes
+       - se não achar, usa Enter no input ou form.submit()
     3) Considera 'ok' se aparecer ao menos um 'Perfil Completo' na listagem.
     Retorna dict com 'status', 'qtd' e logs em steps.
     """
@@ -86,26 +107,118 @@ def buscar_sbcp(nome: str, email: str = "", steps: Optional[List[str]] = None) -
                 _log(steps, f"preenchendo nome: {nome}")
                 nome_input.fill(nome)
 
-                # Botão Buscar (variações comuns)
-                _log(steps, "clicando em Buscar…")
-                btn_buscar = page.locator("text=Buscar, #cirurgiao_submit, button[type='submit']").first
-                if not btn_buscar.count():
-                    _log(steps, "ERRO: botão Buscar não encontrado")
-                    return {"status": "error", "reason": "botao_buscar_nao_encontrado", "qtd": 0}
+                # ===== Patch robusto para encontrar/submeter a busca =====
 
-                btn_buscar.click()
+                # 1) tenta fechar banner de cookies (vários rótulos comuns)
+                try:
+                    _log(steps, "checando banner de cookies…")
+                    cookie_btn = page.locator(
+                        "text=/Aceitar|Concordo|OK|Fechar|Accept|Agree/i, "
+                        "button#onetrust-accept-btn-handler, "
+                        ".ot-sdk-container button[aria-label*='accept' i], "
+                        ".cli-modal .cli_settings_button, .cli-modal .wt-cli-accept-all-btn"
+                    ).first
+                    if cookie_btn and cookie_btn.count() and cookie_btn.is_visible():
+                        cookie_btn.click(timeout=1000)
+                        _log(steps, "banner de cookies fechado.")
+                except Exception:
+                    _log(steps, "nenhum banner de cookies clicável.")
 
-                # pequeno aguardo para a listagem renderizar
+                # helper para achar o botão em uma page/frame
+                def _find_buscar(ctx):
+                    candidatos = [
+                        "text=/\\bBuscar\\b/i",
+                        "text=/Pesquisar/i",
+                        "text=/Procurar/i",
+                        "button[type='submit']",
+                        "input[type='submit']",
+                        "#cirurgiao_submit",
+                        "input[value=/Buscar|Pesquisar|Procurar/i]",
+                    ]
+                    # ARIA role com regex
+                    try:
+                        by_role = ctx.get_by_role("button", name=re.compile(r"(buscar|pesquisar|procurar)", re.I))
+                        if by_role.count():
+                            return by_role.first
+                    except Exception:
+                        pass
+                    # CSS/Text candidatos
+                    for sel in candidatos:
+                        loc = ctx.locator(sel).first
+                        try:
+                            if loc.count() and loc.is_visible():
+                                return loc
+                        except Exception:
+                            continue
+                    return None
+
+                _log(steps, "localizando botão de busca…")
+                btn_buscar = _find_buscar(page)
+
+                # 2) se não achou na página principal, varre iframes
+                if not btn_buscar:
+                    _log(steps, "não achou na raiz; procurando em iframes…")
+                    for fr in page.frames:
+                        try:
+                            if fr == page.main_frame:
+                                continue
+                            cand = _find_buscar(fr)
+                            if cand:
+                                btn_buscar = cand
+                                _log(steps, "botão encontrado dentro de iframe.")
+                                break
+                        except Exception:
+                            continue
+
+                # 3) aciona a busca (click | Enter | form.submit)
+                submetido = False
+                if btn_buscar:
+                    _log(steps, "clicando em Buscar…")
+                    try:
+                        btn_buscar.scroll_into_view_if_needed(timeout=1500)
+                    except Exception:
+                        pass
+                    try:
+                        btn_buscar.click(timeout=3000)
+                        submetido = True
+                    except Exception as e:
+                        _log(steps, f"click falhou: {e}; tentando via Enter…")
+
+                if not submetido:
+                    try:
+                        _log(steps, "submetendo via Enter no campo de nome…")
+                        nome_input.press("Enter")
+                        submetido = True
+                    except Exception as e:
+                        _log(steps, f"Enter falhou: {e}; tentando form.submit()…")
+                        try:
+                            form = page.locator("form").first
+                            if form and form.count():
+                                form.evaluate("el => el.submit()")
+                                submetido = True
+                        except Exception as e2:
+                            _log(steps, f"form.submit() falhou: {e2}")
+
+                # 4) aguarda e coleta resultados
                 page.wait_for_timeout(1200)
-
                 _log(steps, "aguardando resultados (Perfil Completo)…")
                 try:
                     page.locator("text=/Perfil Completo/i").first.wait_for(timeout=7000)
                 except PWTimeout:
-                    _log(steps, "timeout esperando 'Perfil Completo'")
+                    _log(steps, "timeout esperando 'Perfil Completo' — pode ser zero resultados.")
 
                 qtd = page.locator("text=/Perfil Completo/i").count()
                 _log(steps, f"qtd_perfil_completo={qtd}")
+
+                # Screenshot opcional (descomente se quiser salvar no payload)
+                # try:
+                #     if qtd == 0:
+                #         snap = page.screenshot(full_page=True)
+                #         screenshot_b64 = base64.b64encode(snap).decode("ascii")
+                #         _log(steps, "anexando screenshot base64 (sem resultados)…")
+                #         return {"status": ("ok" if qtd > 0 else "not_found"), "qtd": qtd, "screenshot_b64": screenshot_b64}
+                # except Exception:
+                #     pass
 
                 return {"status": ("ok" if qtd > 0 else "not_found"), "qtd": qtd}
 
@@ -165,8 +278,12 @@ def main():
             "resultados": [],                 # não expandimos cartões/links; suficiente p/ validação
             "timing_ms": int((t1 - t0) * 1000),
             "tried_install": bool(res.get("tried_install", False)),
-            "debug": {"steps": steps[-150:]}, # limita tamanho do log salvo no DB
+            "debug": {"steps": steps[-200:]}, # limita tamanho do log salvo no DB
         }
+
+        # Se você habilitar screenshot no bloco acima, una aqui:
+        if "screenshot_b64" in res:
+            payload["screenshot_b64"] = res["screenshot_b64"]
 
         out = {
             "status": res["status"],
@@ -189,7 +306,7 @@ def main():
                 "resultados": [],
                 "timing_ms": int((t1 - t0) * 1000),
                 "tried_install": False,
-                "debug": {"steps": steps[-150:]},
+                "debug": {"steps": steps[-200:]},
             },
         }
         print(json.dumps(out, ensure_ascii=False))

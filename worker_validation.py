@@ -80,19 +80,19 @@ def claim_job(conn):
 
 def finalize_job(conn, job_id: int, member_id: int, status: str, payload: dict):
     """
-    status vindo do runner: 'ok' | 'not_found' | 'error'
-    Grava no banco usando: 'aprovado' | 'pendente' | 'recusado'
+    status do runner: 'ok' | 'not_found' | 'error'
+    grava no banco:   'aprovado' | 'recusado' | 'pendente'
     """
     payload_json = json.dumps(payload or {}, ensure_ascii=False)
     fonte = payload.get("fonte", "sbcp")
 
-    # Map do resultado técnico -> status do seu schema
+    # map técnico -> negócio (PT)
     if status == "ok":
         novo_status = "aprovado"
     elif status == "not_found":
         novo_status = "recusado"
     else:
-        novo_status = "pendente"     # erro transitório -> mantém pendente
+        novo_status = "pendente"  # erro transitório
 
     # Atualiza membro
     conn.execute(text("""
@@ -103,14 +103,14 @@ def finalize_job(conn, job_id: int, member_id: int, status: str, payload: dict):
          WHERE id = :member_id
     """), {"novo_status": novo_status, "fonte": fonte, "member_id": member_id})
 
-    # Log
+    # Log (corrigido: binds com :payload e CAST para jsonb)
     conn.execute(text("""
         INSERT INTO validations_log (member_id, fonte, status, payload)
-        VALUES (:member_id, :fonte, :status, :payload::jsonb)
+        VALUES (:member_id, :fonte, :status, CAST(:payload AS jsonb))
     """), {
         "member_id": member_id,
         "fonte": fonte,
-        "status": status,        # mantenha o status técnico no log
+        "status": status,          # mantenho o status técnico no log
         "payload": payload_json
     })
 
@@ -118,14 +118,19 @@ def finalize_job(conn, job_id: int, member_id: int, status: str, payload: dict):
     new_job_status = "DONE" if status in ("ok", "not_found") else "FAILED"
     conn.execute(text("""
         UPDATE validation_jobs
-           SET status = :new_status,
+           SET status      = :new_status,
                finished_at = now(),
-               last_error  = CASE WHEN :new_status='FAILED' THEN :err ELSE NULL END
+               last_error  = CASE WHEN :new_status = 'FAILED' THEN :err ELSE NULL END
          WHERE id = :id
-    """), {"new_status": new_job_status, "err": payload_json if new_job_status=="FAILED" else None, "id": job_id})
+    """), {
+        "new_status": new_job_status,
+        "err": payload_json if new_job_status == "FAILED" else None,
+        "id": job_id
+    })
 
     if VERBOSE_LOG:
         print(f"✅ Job {job_id} -> {new_job_status.upper()} (membro {member_id}: {novo_status}/{fonte})", flush=True)
+
 
 def retry_or_fail(conn, job_row):
     """

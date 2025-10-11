@@ -5,6 +5,7 @@
 # - Tenta inserir em membersnextlevel sem sobrescrever (ON CONFLICT DO NOTHING)
 # - Marca audit como inserted | duplicate | invalid | error
 # - Normaliza e-mail (strip + lower)
+# - Enfileira validação em validation_jobs quando o membro está 'pending'
 # - Parser resiliente para payloads:
 #     A) { "event_id": "...", "event": { "usuario": { id, nome, email, celular, criado_em, ... } } }
 #     B) { "event": { id, nome, email, celular, ... } }
@@ -82,7 +83,7 @@ def parse_payload(data: dict):
     """
     d = data or {}
 
-    # Preferência: event_id na raiz (observado no seu log Cademi)
+    # Preferência: event_id na raiz (observado no log da Cademi)
     event_id = d.get("event_id") or d.get("id")
 
     evento = d.get("event") or {}
@@ -134,6 +135,24 @@ def parse_payload(data: dict):
 
 
 # -------------------
+# Fila de validação
+# -------------------
+def enqueue_validation_job(conn, member_id: int):
+    """
+    Cria um job de validação para o membro (se ainda estiver pendente).
+    Usa 'sbcp' como fonte inicial.
+    """
+    conn.execute(text("""
+        INSERT INTO validation_jobs (member_id, email, nome, fonte)
+        SELECT m.id, m.email, m.nome, 'sbcp'
+          FROM membersnextlevel m
+         WHERE m.id = :mid
+           AND COALESCE(m.validacao_acesso, 'pending') = 'pending'
+        ON CONFLICT (member_id, fonte) DO NOTHING
+    """), {"mid": member_id})
+
+
+# -------------------
 # DB persistence (append-only + insert-only)
 # -------------------
 def persist_db(data: dict):
@@ -142,6 +161,7 @@ def persist_db(data: dict):
     2) Se email for válido, tenta inserir no membersnextlevel SEM sobrescrever:
        ON CONFLICT(email) DO NOTHING.
     3) Atualiza o status no audit: inserted | duplicate | invalid | error.
+    4) Enfileira validação em validation_jobs quando o membro estiver 'pending'.
     Retorna dict com {status, members_id, audit_id}.
     """
     if not engine:
@@ -181,9 +201,7 @@ def persist_db(data: dict):
         # 2) Se email inválido, apenas marca como invalid e não tenta inserir
         if not is_valid_email(email_norm):
             conn.execute(
-                text(
-                    "UPDATE webhook_members_audit SET status = 'invalid' WHERE id = :audit_id"
-                ),
+                text("UPDATE webhook_members_audit SET status = 'invalid' WHERE id = :audit_id"),
                 {"audit_id": audit_id},
             )
             return {"status": "invalid", "members_id": None, "audit_id": audit_id}
@@ -210,20 +228,49 @@ def persist_db(data: dict):
             ).fetchone()
 
             if row:
+                # INSERIU NOVO
                 status = "inserted"
                 members_id = row[0]
+
+                # atualiza audit
+                conn.execute(
+                    text("UPDATE webhook_members_audit SET status = :status WHERE id = :audit_id"),
+                    {"status": status, "audit_id": audit_id},
+                )
+
+                # ENFILEIRA VALIDAÇÃO (somente se ainda 'pending')
+                enqueue_validation_job(conn, members_id)
+
+                return {"status": status, "members_id": members_id, "audit_id": audit_id}
+
             else:
+                # DUPLICADO: pegar o id existente para enfileirar (sem sobrescrever)
+                existing = conn.execute(
+                    text(
+                        """
+                        SELECT id, COALESCE(validacao_acesso, 'pending') AS st
+                          FROM membersnextlevel
+                         WHERE email = :email
+                         LIMIT 1
+                        """
+                    ),
+                    {"email": email_norm},
+                ).fetchone()
+
                 status = "duplicate"
-                members_id = None
+                members_id = existing.id if existing else None
 
-            conn.execute(
-                text(
-                    "UPDATE webhook_members_audit SET status = :status WHERE id = :audit_id"
-                ),
-                {"status": status, "audit_id": audit_id},
-            )
+                # atualiza audit
+                conn.execute(
+                    text("UPDATE webhook_members_audit SET status = :status WHERE id = :audit_id"),
+                    {"status": status, "audit_id": audit_id},
+                )
 
-            return {"status": status, "members_id": members_id, "audit_id": audit_id}
+                # se achou o membro e ainda está pendente, enfileira
+                if existing and existing.st == "pending":
+                    enqueue_validation_job(conn, members_id)
+
+                return {"status": status, "members_id": members_id, "audit_id": audit_id}
 
         except SQLAlchemyError as e:
             conn.execute(

@@ -34,12 +34,40 @@ def _get_engine() -> Engine:
         _engine_cache = create_engine(db_url, pool_pre_ping=True, future=True)
     return _engine_cache
 
-def log_validation(member_id: int, fonte: str, status: str, payload: Dict[str, Any] | None) -> None:
+def log_validation(member_id: int, fonte: str, status: str, payload=None, *args, **kwargs) -> None:
     """
     Insere log na tabela validations_log.
-    payload é convertido para jsonb via cast explícito.
+    Compatível com chamadas que passam 1 argumento extra (ex.: steps, reason etc.).
+    Qualquer extra é embutido em payload["extra"].
     """
+    from sqlalchemy import text  # garantia local
     engine = _get_engine()
+
+    # Normaliza payload em dict
+    if payload is None:
+        payload = {}
+    elif not isinstance(payload, dict):
+        try:
+            payload = dict(payload)  # tenta converter
+        except Exception:
+            payload = {"value": payload}
+
+    # Se vieram args/kwargs extras do worker, guarda em payload["extra"]
+    extra = {}
+    if args:
+        # se for um único item simples, guarda direto
+        if len(args) == 1:
+            extra["arg"] = args[0]
+        else:
+            extra["args"] = list(args)
+    if kwargs:
+        extra["kwargs"] = kwargs
+    if extra:
+        payload["extra"] = extra
+
+    # Serializa para jsonb no Postgres
+    payload_json = json.dumps(payload, ensure_ascii=False)
+
     with engine.begin() as conn:
         conn.execute(
             text("""
@@ -50,9 +78,10 @@ def log_validation(member_id: int, fonte: str, status: str, payload: Dict[str, A
                 "member_id": int(member_id),
                 "fonte": fonte,
                 "status": status,
-                "payload": json.dumps(payload or {}, ensure_ascii=False),
+                "payload": payload_json,
             }
         )
+
 
 def set_member_validation(member_id: int, status: str, fonte: str, last_error: str | None = None) -> None:
     """
@@ -307,3 +336,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

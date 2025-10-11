@@ -285,18 +285,18 @@ def persist_db(data: dict):
                 return {"status": status, "members_id": members_id, "audit_id": audit_id}
 
         except SQLAlchemyError as e:
-            conn.execute(
-                text(
-                    """
-                    UPDATE webhook_members_audit
-                       SET status = 'error', error_msg = :msg
-                     WHERE id = :audit_id
-                    """
-                ),
-                {"msg": str(e), "audit_id": audit_id},
-            )
+            # A transação atual será revertida automaticamente pelo context manager.
+            # Abra uma NOVA transação para marcar o audit como 'error'.
+            try:
+                with engine.begin() as conn2:
+                    conn2.execute(text("""
+                        UPDATE webhook_members_audit
+                           SET status = 'error', error_msg = :msg
+                         WHERE id = :audit_id
+                    """), {"msg": str(e), "audit_id": audit_id})
+            except Exception as e2:
+                print(f"⚠️ Falha ao marcar audit como error: {e2}", flush=True)
             raise
-
 
 # -------------------
 # Routes
@@ -343,4 +343,3 @@ def webflow_webhook():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
-

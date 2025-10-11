@@ -1,331 +1,160 @@
 # webflow_payloads.py
-# -------------------
-# Webhook do Webflow/Cademi -> Render -> NeonDB
-# - Arquiva TODO POST em webhook_members_audit (append-only)
-# - Tenta inserir em membersnextlevel sem sobrescrever (ON CONFLICT DO NOTHING)
-# - Marca audit como inserted | duplicate | invalid | error
-# - Normaliza e-mail (strip + lower)
-# - Enfileira validação em validation_jobs quando o membro está 'pending'
-# - Parser resiliente para payloads:
-#     A) { "event_id": "...", "event": { "usuario": { id, nome, email, celular, criado_em, ... } } }
-#     B) { "event": { id, nome, email, celular, ... } }
-#     C) { id, nome, email, celular, ... }  (fallback)
+# Flask endpoint para receber somente o webhook do Webflow (Form Submission)
+# Requisitos:
+# - ENV: DATABASE_URL (postgres://... ou postgresql+psycopg2://...)
+# - Tabelas esperadas:
+#   * webhook_members_audit(payload_id text unique nulls not distinct, fonte text, status text, payload jsonb, created_at timestamptz default now())
+#   * membersnextlevel(id serial/bigserial PK, nome text, email text unique, doc text, metadata jsonb, validacao_acesso text, portal_validado text, created_at timestamptz default now())
+#   * validation_jobs(id serial PK, member_id int, email text, nome text, fonte text, status text, attempts int default 0, created_at timestamptz default now())
+#
+# Idempotência:
+# - Usa payload_id do Webflow (payload.id). Se duplicado, não reprocessa.
 
-from flask import Flask, request, jsonify
 import os
 import json
-import re
-from datetime import datetime
-
+import datetime as dt
+from flask import Flask, request, jsonify
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
 
-# -------------------
-# Config
-# -------------------
 app = Flask(__name__)
-OUTPUT_FILE = os.getenv("WEBFLOW_OUTPUT_FILE", "webflow_payloads.json")
 
-DB_URL = os.getenv("DATABASE_URL")  # ex: postgres://user:pass@host/db
-engine = create_engine(DB_URL, pool_pre_ping=True) if DB_URL else None
+# --- Config DB ---
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL não configurado")
 
+# Aceita tanto URL puro do Postgres quanto prefixo do SQLAlchemy
+if not DATABASE_URL.startswith(("postgresql://", "postgresql+psycopg2://")):
+    # render costuma expor como postgres://; SQLAlchemy prefere postgresql+psycopg2://
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 
-# -------------------
-# Utils
-# -------------------
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+ENGINE = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_size=int(os.environ.get("DB_POOL_SIZE", "5")),
+    max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", "5")),
+)
 
+# --- Helpers ---
+def now_utc_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
 
-def norm_email(s: str) -> str:
-    """Normaliza e-mail para unicidade consistente."""
-    return (s or "").strip().lower()
+def _norm(v):
+    return (v or "").strip()
 
+def _lower_keys(d: dict) -> dict:
+    return {str(k).lower(): v for k, v in (d or {}).items()}
 
-def is_valid_email(s: str) -> bool:
-    s = (s or "").strip()
-    if not s:
-        return False
-    # validação simples para evitar falsos positivos
-    return EMAIL_RE.match(s) is not None
-
-
-def save_payload_locally(data: dict) -> None:
-    """Guarda o payload num arquivo local (debug/troubleshooting)."""
-    try:
-        if not data:
-            return
-        payload = []
-        if os.path.exists(OUTPUT_FILE):
-            try:
-                with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
-                    payload = json.load(f)
-                    if not isinstance(payload, list):
-                        payload = []
-            except Exception:
-                payload = []
-        payload.append(
-            {
-                "received_at": datetime.utcnow().isoformat() + "Z",
-                "data": data,
-            }
-        )
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️  Falha ao salvar payload local: {e}", flush=True)
+# --- Healthcheck / debug ---
+@app.get("/")
+def root():
+    return jsonify({
+        "ok": True,
+        "service": "webflow-webhook",
+        "time": now_utc_iso()
+    }), 404  # 404 mantido pra não confundir uptime check do Render
 
 
-def parse_payload(data: dict):
-    """
-    Extrai campos de forma resiliente:
-    - Suporta event.usuario (Cademi), event plano, ou raiz plana.
-    Retorna dict com event_id, nome, email_raw, celular, created_at (string).
-    """
-    d = data or {}
-
-    # Preferência: event_id na raiz (observado no log da Cademi)
-    event_id = d.get("event_id") or d.get("id")
-
-    evento = d.get("event") or {}
-    usuario = {}
-    if isinstance(evento, dict):
-        # Cademi: { "event": { "usuario": {...} } }
-        usuario = evento.get("usuario") or {}
-        # Alguns provedores colocam direto: { "event": { id, nome, email } }
-        if not usuario and any(k in evento for k in ("email", "nome", "celular", "id")):
-            usuario = evento
-
-    # fallback para raiz plana
-    raiz = d if any(k in d for k in ("email", "nome", "celular")) else {}
-
-    nome = (
-        (usuario.get("nome") if isinstance(usuario, dict) else None)
-        or evento.get("nome")
-        or raiz.get("nome")
-        or ""
-    )
-    email_raw = (
-        (usuario.get("email") if isinstance(usuario, dict) else None)
-        or evento.get("email")
-        or raiz.get("email")
-        or ""
-    )
-    celular = (
-        (usuario.get("celular") if isinstance(usuario, dict) else None)
-        or evento.get("celular")
-        or raiz.get("celular")
-        or ""
-    )
-
-    # created_at pode vir como "criado_em" no usuário (Cademi)
-    created_at = (
-        (usuario.get("criado_em") if isinstance(usuario, dict) else None)
-        or d.get("created_at")
-        or ""
-    )
-
-    # normaliza para string
-    return {
-        "event_id": str(event_id or ""),
-        "nome": str(nome or ""),
-        "email_raw": str(email_raw or ""),
-        "celular": str(celular or ""),
-        "created_at": str(created_at or ""),
-    }
-
-
-# -------------------
-# Fila de validação
-# -------------------
-def enqueue_validation_job(conn, member_id: int):
-    conn.execute(text("""
-        INSERT INTO validation_jobs (member_id, email, nome, fonte)
-        SELECT m.id, m.email, m.nome, 'sbcp'
-          FROM membersnextlevel m
-         WHERE m.id = :mid
-           AND COALESCE(m.validacao_acesso, 'pendente') = 'pendente'
-        ON CONFLICT (member_id, fonte) DO UPDATE
-           SET status='PENDING', attempts=0, started_at=NULL, finished_at=NULL, last_error=NULL
-         WHERE validation_jobs.status <> 'RUNNING'
-    """), {"mid": member_id})
-
-
-# -------------------
-# DB persistence (append-only + insert-only)
-# -------------------
-def persist_db(data: dict):
-    """
-    1) Sempre arquiva a tentativa em webhook_members_audit (append-only).
-    2) Se email for válido, tenta inserir no membersnextlevel SEM sobrescrever:
-       ON CONFLICT(email) DO NOTHING.
-    3) Atualiza o status no audit: inserted | duplicate | invalid | error.
-    4) Enfileira validação em validation_jobs quando o membro estiver 'pending'.
-    Retorna dict com {status, members_id, audit_id}.
-    """
-    if not engine:
-        print("⚠️  DATABASE_URL não configurado; pulando persistência no Neon.", flush=True)
-        return {"status": "no_db", "members_id": None, "audit_id": None}
-
-    fields = parse_payload(data)
-    event_id = fields["event_id"]
-    nome = fields["nome"]
-    email_raw = fields["email_raw"]
-    email_norm = norm_email(email_raw)
-    celular = fields["celular"]
-    created_at = fields["created_at"]
-    raw_json = json.dumps(data, ensure_ascii=False)
-
-    with engine.begin() as conn:
-        # 1) Insere audit como 'pending'
-        audit_id = conn.execute(
-            text(
-                """
-                INSERT INTO webhook_members_audit
-                    (event_id, source, email_raw, email_norm, status, payload_raw)
-                VALUES
-                    (:event_id, :source, :email_raw, :email_norm, 'pending', :payload_raw)
-                RETURNING id
-                """
-            ),
-            {
-                "event_id": event_id,
-                "source": "webflow",
-                "email_raw": email_raw,
-                "email_norm": email_norm,
-                "payload_raw": raw_json,
-            },
-        ).scalar_one()
-
-        # 2) Se email inválido, apenas marca como invalid e não tenta inserir
-        if not is_valid_email(email_norm):
-            conn.execute(
-                text("UPDATE webhook_members_audit SET status = 'invalid' WHERE id = :audit_id"),
-                {"audit_id": audit_id},
-            )
-            return {"status": "invalid", "members_id": None, "audit_id": audit_id}
-
-        try:
-            # 3) Tenta gravação no members (insert-only)
-            row = conn.execute(
-                text(
-                    """
-                    INSERT INTO membersnextlevel (event_id, nome, email, celular, created_at, raw)
-                    VALUES (:event_id, :nome, :email, :celular, :created_at, :raw)
-                    ON CONFLICT (email) DO NOTHING
-                    RETURNING id
-                    """
-                ),
-                {
-                    "event_id": event_id,
-                    "nome": nome,
-                    "email": email_norm,
-                    "celular": celular,
-                    "created_at": created_at,
-                    "raw": raw_json,
-                },
-            ).fetchone()
-
-            if row:
-                # INSERIU NOVO
-                status = "inserted"
-                members_id = row[0]
-
-                # atualiza audit
-                conn.execute(
-                    text("UPDATE webhook_members_audit SET status = :status WHERE id = :audit_id"),
-                    {"status": status, "audit_id": audit_id},
-                )
-
-                # ENFILEIRA VALIDAÇÃO (somente se ainda 'pending')
-                enqueue_validation_job(conn, members_id)
-
-                return {"status": status, "members_id": members_id, "audit_id": audit_id}
-
-            else:
-                # DUPLICADO: pegar o id existente para enfileirar (sem sobrescrever)
-                existing = conn.execute(
-                    text(
-                        """
-                        SELECT id, COALESCE(validacao_acesso, 'pending') AS st
-                          FROM membersnextlevel
-                         WHERE email = :email
-                         LIMIT 1
-                        """
-                    ),
-                    {"email": email_norm},
-                ).fetchone()
-
-                status = "duplicate"
-                members_id = existing.id if existing else None
-
-                # atualiza audit
-                conn.execute(
-                    text("UPDATE webhook_members_audit SET status = :status WHERE id = :audit_id"),
-                    {"status": status, "audit_id": audit_id},
-                )
-
-                # se achou o membro e ainda está pendente, enfileira
-                if existing and existing.st == "pending":
-                    enqueue_validation_job(conn, members_id)
-
-                return {"status": status, "members_id": members_id, "audit_id": audit_id}
-
-        except SQLAlchemyError as e:
-            # A transação atual será revertida automaticamente pelo context manager.
-            # Abra uma NOVA transação para marcar o audit como 'error'.
-            try:
-                with engine.begin() as conn2:
-                    conn2.execute(text("""
-                        UPDATE webhook_members_audit
-                           SET status = 'error', error_msg = :msg
-                         WHERE id = :audit_id
-                    """), {"msg": str(e), "audit_id": audit_id})
-            except Exception as e2:
-                print(f"⚠️ Falha ao marcar audit como error: {e2}", flush=True)
-            raise
-
-# -------------------
-# Routes
-# -------------------
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"ok": True, "ts": datetime.utcnow().isoformat() + "Z"}), 200
-
-
-@app.route("/webflow-webhook", methods=["POST"])
+# --- Rota principal: só aceita Webflow Form Submission ---
+@app.post("/webflow-webhook")
 def webflow_webhook():
-    data = request.get_json(silent=True) or {}
-    print("🔔 Webhook recebido", flush=True)
+    body = request.get_json(silent=True) or {}
+    trigger = body.get("triggerType")
+
+    # Apenas Webflow Form Submission
+    if trigger != "form_submission":
+        print(f"🚫 NOT_WEBFLOW_FORM: triggerType={trigger!r} ignorado")
+        return jsonify({"ok": True, "skipped": "not_webflow_form"}), 200
+
+    pf = body.get("payload") or {}
+    data = pf.get("data") or {}
+    payload_id = _norm(pf.get("id"))
+    form_name = _norm(pf.get("name"))
+
+    # Normaliza as chaves do 'data' para lower (Webflow pode mandar "Rqe")
+    dlow = _lower_keys(data)
+    nome    = _norm(dlow.get("nome") or dlow.get("nome_completo"))
+    email   = _norm(dlow.get("email")).lower()
+    celular = _norm(dlow.get("celular") or dlow.get("whatsapp"))
+    # IMPORTANTE: seu Webflow mostra "Rqe"
+    rqe     = _norm(dlow.get("rqe") or dlow.get("rqe_crefito"))
+
+    print(f"📨 WEBFLOW payload_id={payload_id} form={form_name} nome={nome} email={email} rqe={rqe}")
+
+    # Validação mínima
+    if not nome or not email or not rqe:
+        print("⚠️ MISSING_REQUIRED_FIELDS", {"nome": bool(nome), "email": bool(email), "rqe": bool(rqe)})
+        return jsonify({
+            "ok": True,
+            "skipped": "missing_required_fields",
+            "got": {"nome": bool(nome), "email": bool(email), "rqe": bool(rqe)}
+        }), 200
 
     try:
-        f = parse_payload(data)
-        print(
-            f"    → event_id={f['event_id']} nome={f['nome']} email={f['email_raw']}",
-            flush=True,
-        )
-    except Exception:
-        pass
+        with ENGINE.begin() as conn:
+            # 1) Auditoria + idempotência por payload_id
+            #    Requer índice único:
+            #    CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_audit_payload_id
+            #      ON webhook_members_audit(payload_id) WHERE payload_id IS NOT NULL;
+            audit_res = conn.execute(text("""
+                INSERT INTO webhook_members_audit (payload_id, fonte, status, payload, created_at)
+                VALUES (:payload_id, 'webflow', 'received', :payload::jsonb, NOW())
+                ON CONFLICT (payload_id) DO NOTHING
+            """), {"payload_id": payload_id, "payload": json.dumps(body)})
 
-    save_payload_locally(data)
+            if payload_id and audit_res.rowcount == 0:
+                # Já recebemos esse payload antes → não reprocessa
+                print(f"🔁 DEDUPE: payload_id={payload_id} já processado")
+                return jsonify({"ok": True, "deduped": True}), 200
 
-    try:
-        result = persist_db(data)
-        print(
-            f"🗄️  Persistência DB → status={result['status']} "
-            f"audit_id={result.get('audit_id')} members_id={result.get('members_id')}",
-            flush=True,
-        )
-        # Retorne 200 sempre; status detalha o que ocorreu
-        return jsonify({"ok": True, **result}), 200
+            # 2) Upsert do membro com RETURNING id
+            row = conn.execute(text("""
+                INSERT INTO membersnextlevel (nome, email, doc, metadata, validacao_acesso, portal_validado, created_at)
+                VALUES (:nome, :email, :doc, jsonb_build_object('celular', :celular), 'pending', 'sbcp', NOW())
+                ON CONFLICT (email) DO UPDATE
+                  SET nome = EXCLUDED.nome,
+                      doc  = EXCLUDED.doc,
+                      metadata = COALESCE(membersnextlevel.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+                      validacao_acesso = 'pending',
+                      portal_validado  = 'sbcp'
+                RETURNING id
+            """), {"nome": nome, "email": email, "doc": rqe, "celular": celular}).first()
+
+            if row is None:
+                # fallback extremamente raro
+                row = conn.execute(text("SELECT id FROM membersnextlevel WHERE email = :email"),
+                                   {"email": email}).first()
+            if row is None:
+                raise RuntimeError("Não foi possível obter member_id após upsert")
+
+            member_id = row[0]
+
+            # 3) Enfileira job PENDING (idempotente por member_id)
+            conn.execute(text("""
+                INSERT INTO validation_jobs (member_id, email, nome, fonte, status, attempts, created_at)
+                VALUES (:mid, :email, :nome, 'sbcp', 'PENDING', 0, NOW())
+                ON CONFLICT (member_id) DO NOTHING
+            """), {"mid": member_id, "email": email, "nome": nome})
+
+        print(f"✅ PROCESSADO: member_id={member_id} → pending/sbcp")
+        return jsonify({"ok": True, "member_id": member_id, "status": "pending"}), 200
+
     except Exception as e:
-        print(f"⚠️  Falha ao gravar no DB: {e}", flush=True)
-        # Evita retries agressivos: mantém 200 mas indica erro no corpo
-        return jsonify({"ok": False, "error": str(e)}), 200
+        # Loga erro técnico em validations_log (não falha a transação geral)
+        print("💥 ERRO HANDLER:", repr(e))
+        try:
+            with ENGINE.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO validations_log (member_id, fonte, status, payload, created_at)
+                    VALUES (NULL, 'webflow', 'error', :payload::jsonb, NOW())
+                """), {"payload": json.dumps({"error": str(e), "body": body})})
+        except Exception as ee:
+            print("⚠️ falhou ao logar erro:", repr(ee))
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# -------------------
-# Main
-# -------------------
+# --- Gunicorn entrypoint ---
+# Procfile/Render: web: gunicorn webflow_payloads:app
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+    # Execução local (dev)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")), debug=True)

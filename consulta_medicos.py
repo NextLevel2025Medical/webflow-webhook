@@ -11,25 +11,25 @@ URL = "https://www.cirurgiaplastica.org.br/encontre-um-cirurgiao/#busca-cirurgia
 def _log(steps: List[str], msg: str):
     steps.append(msg)
 
-def _ensure_browser_once(steps: List[str]) -> bool:
+def _ensure_browser_once(steps: list) -> bool:
     """
-    Garante que o Chromium esteja instalado. Retorna True se tentou instalar agora.
-    Não usa --with-deps (sem root no Render).
+    Faz o fallback de instalação do Chromium em runtime.
     """
     try:
-        _log(steps, "playwright install chromium (se necessário)...")
+        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
+        steps.append("playwright install chromium (fallback runtime)…")
         out = subprocess.run(
-            ["python", "-m", "playwright", "install", "chromium", "--with-deps=false"],
-            capture_output=True, text=True, timeout=180
+            ["python", "-m", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=240
         )
-        _log(steps, f"playwright install rc={out.returncode}")
+        steps.append(f"playwright install rc={out.returncode}")
         if out.stdout:
-            _log(steps, f"install stdout: {out.stdout[-500:]}")
+            steps.append(f"install stdout: {out.stdout[-500:]}")
         if out.stderr:
-            _log(steps, f"install stderr: {out.stderr[-500:]}")
-        return True
+            steps.append(f"install stderr: {out.stderr[-500:]}")
+        return out.returncode == 0
     except Exception as e:
-        _log(steps, f"playwright install falhou: {e}")
+        steps.append(f"playwright install falhou: {e}")
         return False
 
 def buscar_sbcp(nome: str, email: str = "") -> Dict:
@@ -147,3 +147,4 @@ if __name__ == "__main__":
     email_cli = sys.argv[2] if len(sys.argv) > 2 else ""
     import json
     print(json.dumps(buscar_sbcp(nome_cli, email_cli), ensure_ascii=False))
+

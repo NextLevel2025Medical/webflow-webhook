@@ -1,127 +1,224 @@
-# worker_validation.py (sem resultados.json; import direto)
-import os, json, time, signal, sys
-from typing import Dict, Any
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
-from datetime import timezone, datetime
+# worker_validation.py
+# Loop que consome validation_jobs e valida no(s) portal(is).
+import os
+import time
+import json
+from datetime import datetime, timezone
 
-from consulta_medicos import buscar_sbcp  # <<< import direto
+import psycopg2
+import psycopg2.extras
 
-DB_URL = os.getenv("DATABASE_URL")
-if not DB_URL:
-    print("❌ DATABASE_URL não definido."); sys.exit(1)
+# ====== Config por ENV ======
+DB_URL        = os.getenv("DATABASE_URL")
+POLL_SECONDS  = float(os.getenv("POLL_SECONDS", "3.0"))
+MAX_ATTEMPTS  = int(os.getenv("MAX_ATTEMPTS", "3"))
+FONTE_DEFAULT = os.getenv("FONTE_DEFAULT", "sbcp").lower().strip()
+STUB          = os.getenv("STUB", "false").lower() in ("1", "true", "yes", "on")
 
-engine = create_engine(DB_URL, pool_pre_ping=True)
+# ====== Importa o conector do(s) portal(is) ======
+try:
+    from consulta_medicos import buscar_sbcp
+except Exception as e:
+    print("❌ Falha importando consulta_medicos:", e)
+    buscar_sbcp = None  # será checado adiante
 
-POLL_SECONDS   = float(os.getenv("WORKER_POLL_SECONDS", "3"))
-MAX_ATTEMPTS   = int(os.getenv("WORKER_MAX_ATTEMPTS", "3"))
-VERBOSE_LOG    = os.getenv("WORKER_VERBOSE_LOG", "1") == "1"
-FONTE_DEFAULT  = os.getenv("WORKER_FONTE_DEFAULT", "sbcp")
-WORKER_STUB    = os.getenv("WORKER_STUB", "0") == "1"
+# ====== Helpers ======
+def utcnow_iso():
+    return datetime.now(timezone.utc).isoformat()
 
-_running = True
-def _graceful(signum, frame):
-    global _running; _running = False
-signal.signal(signal.SIGTERM, _graceful); signal.signal(signal.SIGINT, _graceful)
+def db_connect():
+    conn = psycopg2.connect(DB_URL)
+    conn.autocommit = True
+    return conn
 
-def claim_job(conn):
-    row = conn.execute(text("""
-        SELECT id, member_id, email, nome, fonte, attempts
-          FROM validation_jobs
-         WHERE status='PENDING'
-         ORDER BY created_at
-         FOR UPDATE SKIP LOCKED
-         LIMIT 1
-    """)).fetchone()
-    if not row: return None
-    conn.execute(text("""
-        UPDATE validation_jobs
-           SET status='RUNNING', started_at=now(), attempts=attempts+1
-         WHERE id=:id
-    """), {"id": row.id})
-    if VERBOSE_LOG:
-        print(f"⚙️  Job {row.id} -> RUNNING (attempt {row.attempts+1}) [member_id={row.member_id} fonte={row.fonte}]", flush=True)
-    return row
+def dict_cur(conn):
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-def map_status_to_pt(status: str) -> str:
-    return {"ok":"aprovado","not_found":"recusado","error":"pendente"}.get(status,"pendente")
+# ====== SQL (ajuste nomes se necessário) ======
+SQL_RESERVA = """
+WITH nxt AS (
+  SELECT id
+  FROM validation_jobs
+  WHERE status IN ('PENDING', 'RETRY')
+    AND attempts < %(max_attempts)s
+  ORDER BY id
+  FOR UPDATE SKIP LOCKED
+  LIMIT 1
+)
+UPDATE validation_jobs j
+   SET status      = 'RUNNING',
+       started_at  = NOW(),
+       attempts    = attempts + 1
+  FROM nxt
+ WHERE j.id = nxt.id
+RETURNING j.id, j.member_id, j.email, j.nome, j.fonte, j.status, j.attempts;
+"""
 
-def finalize_job(conn, job_id: int, member_id: int, status: str, payload: Dict[str, Any]):
-    payload_json = json.dumps(payload or {}, ensure_ascii=False)
-    fonte = payload.get("fonte", FONTE_DEFAULT)
+SQL_LOG_INS = """
+INSERT INTO validations_log (member_id, fonte, status, payload)
+VALUES (%(member_id)s, %(fonte)s, %(status)s, %(payload)s::jsonb)
+"""
 
-    novo_status = map_status_to_pt(status)
-    conn.execute(text("""
-        UPDATE membersnextlevel
-           SET validacao_acesso=:novo_status,
-               portal_validado=:fonte,
-               validacao_at=now()
-         WHERE id=:member_id
-    """), {"novo_status": novo_status, "fonte": fonte, "member_id": member_id})
+SQL_JOB_DONE = """
+UPDATE validation_jobs
+   SET status = %(status)s,
+       finished_at = NOW(),
+       last_error = %(err)s
+ WHERE id = %(job_id)s
+"""
 
-    conn.execute(text("""
-        INSERT INTO validations_log (member_id, fonte, status, payload)
-        VALUES (:member_id, :fonte, :status, CAST(:payload AS jsonb))
-    """), {"member_id": member_id, "fonte": fonte, "status": status, "payload": payload_json})
+SQL_APROVA_MEMBRO = """
+UPDATE membersnextlevel
+   SET validacao_acesso = 'aprovado',
+       portal_validado  = %(fonte)s
+ WHERE id = %(member_id)s
+"""
 
-    new_job_status = "DONE" if status in ("ok","not_found") else "FAILED"
-    conn.execute(text("""
-        UPDATE validation_jobs
-           SET status=:new_status, finished_at=now(),
-               last_error = CASE WHEN :new_status='FAILED' THEN :payload ELSE NULL END
-         WHERE id=:id
-    """), {"new_status": new_job_status, "payload": payload_json, "id": job_id})
+# ====== Execução de uma validação ======
+def run_validation(job, conn):
+    job_id    = job["id"]
+    member_id = job["member_id"]
+    email     = (job.get("email") or "").strip()
+    nome      = (job.get("nome") or "").strip()
+    fonte     = (job.get("fonte") or FONTE_DEFAULT).lower()
 
-    if VERBOSE_LOG:
-        print(f"✅ Job {job_id} -> {new_job_status} (membro {member_id}: {novo_status}/{fonte})", flush=True)
+    print(f"⚙️  Job {job_id} -> RUNNING (attempt {job['attempts']}) [member_id={member_id} fonte={fonte}]")
 
-def retry_or_fail(conn, job_row):
-    if job_row.attempts >= MAX_ATTEMPTS:
-        conn.execute(text("""
-            UPDATE validation_jobs
-               SET status='FAILED', finished_at=now(),
-                   last_error=COALESCE(last_error,'tentativas excedidas')
-             WHERE id=:id
-        """), {"id": job_row.id})
-        if VERBOSE_LOG: print(f"🧯 Job {job_row.id} -> FAILED definitivo.", flush=True)
-        return False
-    conn.execute(text("UPDATE validation_jobs SET status='PENDING' WHERE id=:id"), {"id": job_row.id})
-    if VERBOSE_LOG: print(f"🔁 Job {job_row.id} re-enfileirado.", flush=True)
-    return True
+    # 1) Executa consulta ao portal (ou STUB)
+    if STUB:
+        resultado = {
+            "status": "ok",
+            "fonte": fonte,
+            "raw": {
+                "nome_busca": nome,
+                "email": email,
+                "qtd": 1,
+                "resultados": [],
+                "timing_ms": 5,
+                "debug": {"steps": ["stub: ok simulado"]}
+            }
+        }
+    else:
+        if fonte == "sbcp":
+            if buscar_sbcp is None:
+                raise RuntimeError("consulta_medicos.buscar_sbcp indisponível")
+            resultado = buscar_sbcp(nome, email)
+        else:
+            resultado = {
+                "status": "error",
+                "fonte": fonte,
+                "raw": {"nome_busca": nome, "email": email, "qtd": 0, "resultados": []},
+                "reason": f"fonte_nao_suportada:{fonte}"
+            }
 
-def run_validator(fonte: str, member_id: int, nome: str, email: str) -> Dict[str, Any]:
-    fonte = (fonte or FONTE_DEFAULT).lower()
-    if WORKER_STUB:
-        return {"status":"ok","fonte":fonte,"raw":{"stub":True,"nome":nome,"email":email}}
-    if fonte == "sbcp":
-        return buscar_sbcp(nome, email)
-    return {"status":"error","fonte":fonte,"reason":"fonte_desconhecida"}
+    status_ext = resultado.get("status", "error")
+    raw        = resultado.get("raw", {})
+    reason     = resultado.get("reason")
+    steps      = (raw.get("debug") or {}).get("steps", [])
 
-def main_loop():
-    print("🧵 Worker de validação iniciado.", flush=True)
-    print(f"Config: POLL_SECONDS={POLL_SECONDS} MAX_ATTEMPTS={MAX_ATTEMPTS} FONTE_DEFAULT={FONTE_DEFAULT} STUB={WORKER_STUB}", flush=True)
+    # 2) Loga passos principais no console para diagnóstico
+    if steps:
+        print("🔎 DEBUG STEPS (finais):")
+        for line in steps[-12:]:
+            print("   •", line)
 
-    while _running:
+    # 3) Registra LOG no DB
+    payload_json = json.dumps(raw, ensure_ascii=False)
+    with conn.cursor() as cur:
+        cur.execute(SQL_LOG_INS, {
+            "member_id": member_id,
+            "fonte": fonte,
+            "status": status_ext,
+            "payload": payload_json,
+        })
+
+    # 4) Decide ação sobre o membro e o job
+    if status_ext == "ok":
+        # Aprova o membro
         try:
-            with engine.begin() as conn:
-                job = claim_job(conn)
-                if not job:
-                    pass
-                else:
-                    result = run_validator(job.fonte, job.member_id, job.nome, job.email)
-                    if result["status"] in ("ok","not_found"):
-                        finalize_job(conn, job.id, job.member_id, result["status"], result)
-                    else:
-                        if retry_or_fail(conn, job):
-                            if VERBOSE_LOG: print(f"⚠️  Job {job.id}: erro transitório; retry.", flush=True)
-                        else:
-                            finalize_job(conn, job.id, job.member_id, "error", result)
-        except SQLAlchemyError as e:
-            print(f"💥 Erro de banco: {e}", flush=True)
+            with conn.cursor() as cur:
+                cur.execute(SQL_APROVA_MEMBRO, {
+                    "member_id": member_id,
+                    "fonte": fonte
+                })
+            with conn.cursor() as cur:
+                cur.execute(SQL_JOB_DONE, {
+                    "status": "SUCCEEDED",
+                    "err": None,
+                    "job_id": job_id
+                })
+            print(f"✅ Job {job_id} -> SUCCEEDED (membro {member_id}: aprovado/{fonte})")
         except Exception as e:
-            print(f"💥 Erro inesperado: {e}", flush=True)
-        time.sleep(POLL_SECONDS)
-    print("👋 Worker finalizado.", flush=True)
+            # Se falhar a atualização do membro, grava erro no job
+            with conn.cursor() as cur:
+                cur.execute(SQL_JOB_DONE, {
+                    "status": "FAILED",
+                    "err": f"update_member_fail: {e}",
+                    "job_id": job_id
+                })
+            print(f"💥 Erro de banco ao aprovar membro {member_id}: {e}")
+
+    elif status_ext in ("not_found", "error"):
+        # Não mexe no membersnextlevel; finaliza como FAILED
+        err_msg = reason or status_ext
+        with conn.cursor() as cur:
+            cur.execute(SQL_JOB_DONE, {
+                "status": "FAILED",
+                "err": err_msg,
+                "job_id": job_id
+            })
+        print(f"🧯 Job {job_id} -> FAILED (membro {member_id}: pendente/{fonte})")
+
+    else:
+        # fallback
+        with conn.cursor() as cur:
+            cur.execute(SQL_JOB_DONE, {
+                "status": "FAILED",
+                "err": f"status_desconhecido:{status_ext}",
+                "job_id": job_id
+            })
+        print(f"🧯 Job {job_id} -> FAILED (status_externo_desconhecido={status_ext})")
+
+# ====== Loop principal ======
+def main():
+    print("🧵 Worker de validação iniciado.")
+    print(f"Config: POLL_SECONDS={POLL_SECONDS} MAX_ATTEMPTS={MAX_ATTEMPTS} FONTE_DEFAULT={FONTE_DEFAULT} STUB={STUB}")
+
+    conn = db_connect()
+    try:
+        while True:
+            job = None
+            try:
+                with dict_cur(conn) as cur:
+                    cur.execute(SQL_RESERVA, {"max_attempts": MAX_ATTEMPTS})
+                    job = cur.fetchone()
+
+                if not job:
+                    time.sleep(POLL_SECONDS)
+                    continue
+
+                # Executa o job reservado
+                try:
+                    run_validation(job, conn)
+                except Exception as e:
+                    # erro inesperado durante a execução: marca FAILED
+                    with conn.cursor() as cur:
+                        cur.execute(SQL_JOB_DONE, {
+                            "status": "FAILED",
+                            "err": f"exception:{e}",
+                            "job_id": job["id"]
+                        })
+                    print(f"💥 Job {job['id']} falhou com exceção: {e}")
+
+            except Exception as loop_err:
+                # erro ao reservar job ou erro externo de conexão
+                print("⚠️  Erro no loop:", loop_err)
+                time.sleep(max(POLL_SECONDS, 2.0))
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
-    main_loop()
+    main()

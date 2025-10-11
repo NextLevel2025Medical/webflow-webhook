@@ -2,20 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-consulta_medicos.py
+consulta_medicos.py (versão tolerante)
 
-- Abre o site da SBCP e busca pelo nome.
-- Clica no primeiro "Perfil Completo" e extrai dados do modal.
-- Imprime JSON em stdout com { ok, qtd, resultados, steps, timing_ms, nome_busca, email }.
-- Hotfix: se o Chromium do Playwright não estiver presente no pod, roda
-  `python -m playwright install chromium` e tenta novamente.
+- Wrapper buscar_sbcp(*args, **kwargs) aceita múltiplas assinaturas:
+    (nome_busca, steps)
+    (conn, nome_busca, steps)
+    (conn, member_id, nome_busca, steps)
+  e também via kwargs (nome/nome_busca, steps).
 
-Também expõe shims de banco compatíveis com o worker:
-- log_validation(...)
-- set_member_validation(...)
+- _buscar_sbcp_core(nome_busca, steps): implementação real (Playwright + scraping).
 
-Ambiente:
-  - DATABASE_URL (ou NEON_DATABASE_URL) com string de conexão Postgres.
+- log_validation / set_member_validation: tolerantes a conexão como 1º arg, args extras
+  e kwargs; fazem CAST para jsonb.
+
+- Hotfix: instala Chromium do Playwright em runtime se necessário.
 """
 
 import os
@@ -43,7 +43,6 @@ MISSING_MSG = "Executable doesn't exist"
 _engine_cache: Optional[Engine] = None
 
 def _get_engine() -> Engine:
-    """Cria (e cacheia) o engine SQLAlchemy a partir da env var."""
     global _engine_cache
     if _engine_cache is None:
         db_url = os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL")
@@ -53,7 +52,6 @@ def _get_engine() -> Engine:
     return _engine_cache
 
 def _looks_like_connection(obj) -> bool:
-    """Detecta se obj parece ser uma conexão (psycopg2, etc.) passada por engano como 1º argumento."""
     try:
         name = obj.__class__.__name__.lower()
         mod  = obj.__class__.__module__.lower()
@@ -63,27 +61,21 @@ def _looks_like_connection(obj) -> bool:
 
 def log_validation(*args, **kwargs) -> None:
     """
-    Formatos aceitos (todos válidos):
-      - log_validation(member_id, fonte, status, payload)
-      - log_validation(conn, member_id, fonte, status, payload)
-      - log_validation(member_id, fonte, status, payload, <extra...>)
-      - log_validation(..., payload=<dict>, steps=<list>, reason=<str>, ...)
-    Extras vão para payload["extra"].
+    Aceita:
+      log_validation(member_id, fonte, status, payload, ...)
+      log_validation(conn, member_id, fonte, status, payload, ...)
+      também via kwargs. Extras vão para payload["extra"].
     """
     engine = _get_engine()
     args = list(args)
-
-    # Se o primeiro argumento for uma conexão (psycopg2/whatever), ignoramos
     if args and _looks_like_connection(args[0]):
         args.pop(0)
 
-    # Extrai campos principais por posição/kwargs
     member_id = args[0] if len(args) > 0 else kwargs.pop("member_id", None)
     fonte     = args[1] if len(args) > 1 else kwargs.pop("fonte", None)
     status    = args[2] if len(args) > 2 else kwargs.pop("status", None)
     payload   = args[3] if len(args) > 3 else kwargs.pop("payload", None)
 
-    # Normaliza payload
     if payload is None:
         payload = {}
     elif not isinstance(payload, dict):
@@ -92,7 +84,6 @@ def log_validation(*args, **kwargs) -> None:
         except Exception:
             payload = {"value": str(payload)}
 
-    # Qualquer resto vai para payload["extra"]
     extra: Dict[str, Any] = {}
     if len(args) > 4:
         extra["args"] = [repr(a) for a in args[4:]]
@@ -101,13 +92,12 @@ def log_validation(*args, **kwargs) -> None:
     if extra:
         payload["extra"] = extra
 
-    # Converte member_id com segurança
     try:
         member_id_int = int(member_id) if member_id is not None else None
     except Exception:
         payload.setdefault("extra", {})
         payload["extra"]["member_id_parse_error"] = repr(member_id)
-        member_id_int = None  # não derruba o log
+        member_id_int = None
 
     payload_json = json.dumps(payload, ensure_ascii=False)
 
@@ -127,14 +117,12 @@ def log_validation(*args, **kwargs) -> None:
 
 def set_member_validation(*args, **kwargs) -> None:
     """
-    Formatos aceitos:
-      - set_member_validation(member_id, status, fonte, last_error=None)
-      - set_member_validation(conn, member_id, status, fonte, last_error=None)
-      - set_member_validation(..., member_id=, status=, fonte=, last_error=)
-    Ignora 1º arg se for conexão. Se coluna last_error não existir, faz update sem ela.
+    Aceita:
+      set_member_validation(member_id, status, fonte, last_error=None)
+      set_member_validation(conn, member_id, status, fonte, last_error=None)
+      também via kwargs.
     """
     engine = _get_engine()
-
     args = list(args)
     if args and _looks_like_connection(args[0]):
         args.pop(0)
@@ -147,12 +135,10 @@ def set_member_validation(*args, **kwargs) -> None:
     try:
         member_id_int = int(member_id) if member_id is not None else None
     except Exception:
-        # não atualiza se não der para interpretar o id
         return
 
     params = {"member_id": member_id_int, "status": status, "fonte": fonte, "last_error": last_error}
 
-    # tenta com last_error; se a coluna não existir, faz fallback
     try:
         with engine.begin() as conn:
             conn.execute(
@@ -182,7 +168,6 @@ def set_member_validation(*args, **kwargs) -> None:
 # =========================
 
 def _ensure_browsers_installed(steps: List[str]) -> bool:
-    """Fallback: baixa Chromium do Playwright em runtime."""
     try:
         steps.append("playwright install chromium (fallback em runtime)")
         proc = subprocess.run(
@@ -202,7 +187,6 @@ def _ensure_browsers_installed(steps: List[str]) -> bool:
         return False
 
 def _fill_by_many_selectors(page, steps: List[str], selectors: List[str], value: str) -> bool:
-    """Tenta localizar um input usando uma lista de seletores e preencher com value."""
     for sel in selectors:
         try:
             locator = page.locator(sel)
@@ -217,7 +201,6 @@ def _fill_by_many_selectors(page, steps: List[str], selectors: List[str], value:
     return False
 
 def _click_by_many_selectors(page, steps: List[str], selectors: List[str]) -> bool:
-    """Tenta clicar usando uma lista de seletores."""
     for sel in selectors:
         try:
             btn = page.locator(sel)
@@ -231,7 +214,6 @@ def _click_by_many_selectors(page, steps: List[str], selectors: List[str]) -> bo
     return False
 
 def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
-    """Extrai campos do modal de perfil completo (estrutura dt/dd)."""
     data: Dict[str, Any] = {}
     try:
         modal = page.locator("div.mfp-content")
@@ -244,14 +226,12 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
         dts = info.locator("dt")
         dds = info.locator("dd")
         count = min(dts.count(), dds.count())
-
         for i in range(count):
             key = dts.nth(i).inner_text().strip().strip(":")
             val = dds.nth(i).inner_text().strip()
             if key:
                 data[key] = val
 
-        # Nome (topo do modal)
         try:
             titulo = modal.locator("h3.cirurgiao-nome").first.inner_text().strip()
             if titulo:
@@ -259,7 +239,6 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Normalizações úteis
         for k in ("CRM", "Crm", "crm"):
             if k in data and "crm_padrao" not in data:
                 data["crm_padrao"] = data[k]
@@ -276,16 +255,14 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
         steps.append(f"erro extraindo perfil: {e}")
     return data
 
-def buscar_sbcp(nome_busca: str, steps: List[str]) -> Dict[str, Any]:
-    """Fluxo de busca no site da SBCP com hotfix de instalação do Chromium."""
+def _buscar_sbcp_core(nome_busca: str, steps: List[str]) -> Dict[str, Any]:
+    """Implementação real da busca (antes chamada buscar_sbcp)."""
     start = time.time()
     resultados: List[Dict[str, Any]] = []
     tried_install = False
 
     with sync_playwright() as p:
         browser = None
-
-        # Hotfix: tentar abrir; se faltar o binário, instalar e tentar de novo.
         while True:
             try:
                 steps.append("launch chromium")
@@ -299,19 +276,16 @@ def buscar_sbcp(nome_busca: str, steps: List[str]) -> Dict[str, Any]:
                     if _ensure_browsers_installed(steps):
                         steps.append("tentando launch novamente após install")
                         continue
-                raise  # não é caso de instalação faltando, propaga
+                raise
 
         context = browser.new_context()
         page = context.new_page()
-
         try:
             steps.append(f"abrindo {SBCP_URL}")
             page.goto(SBCP_URL, wait_until="commit", timeout=30000)
 
-            # Preenche campo "Nome"
             ok_input = _fill_by_many_selectors(
-                page,
-                steps,
+                page, steps,
                 selectors=[
                     "input#cirurgiao_nome",
                     "input[name='cirurgiao_nome']",
@@ -321,20 +295,12 @@ def buscar_sbcp(nome_busca: str, steps: List[str]) -> Dict[str, Any]:
                 value=nome_busca,
             )
             if not ok_input:
-                return {
-                    "ok": False,
-                    "qtd": 0,
-                    "resultados": [],
-                    "steps": steps,
-                    "nome_busca": nome_busca,
-                    "timing_ms": int((time.time() - start) * 1000),
-                    "reason": "input_nome_nao_encontrado",
-                }
+                return {"ok": False, "qtd": 0, "resultados": [], "steps": steps,
+                        "nome_busca": nome_busca, "timing_ms": int((time.time()-start)*1000),
+                        "reason": "input_nome_nao_encontrado"}
 
-            # Clica em "Buscar"
             ok_click = _click_by_many_selectors(
-                page,
-                steps,
+                page, steps,
                 selectors=[
                     "input#cirurgiao_submit",
                     "input[name='cirurgiao_submit']",
@@ -344,17 +310,10 @@ def buscar_sbcp(nome_busca: str, steps: List[str]) -> Dict[str, Any]:
                 ],
             )
             if not ok_click:
-                return {
-                    "ok": False,
-                    "qtd": 0,
-                    "resultados": [],
-                    "steps": steps,
-                    "nome_busca": nome_busca,
-                    "timing_ms": int((time.time() - start) * 1000),
-                    "reason": "botao_buscar_nao_encontrado",
-                }
+                return {"ok": False, "qtd": 0, "resultados": [], "steps": steps,
+                        "nome_busca": nome_busca, "timing_ms": int((time.time()-start)*1000),
+                        "reason": "botao_buscar_nao_encontrado"}
 
-            # Espera wrapper e clica no primeiro "Perfil Completo"
             try:
                 page.wait_for_selector(".cirurgiao-results", timeout=15000)
                 steps.append("lista de resultados visível")
@@ -366,9 +325,7 @@ def buscar_sbcp(nome_busca: str, steps: List[str]) -> Dict[str, Any]:
             perfil_link.click()
             steps.append("clicou em Perfil Completo (primeiro resultado)")
 
-            # Extrai as informações do modal
             dados = _extract_profile(page, steps)
-
             if dados:
                 resultados.append(dados)
 
@@ -400,30 +357,87 @@ def buscar_sbcp(nome_busca: str, steps: List[str]) -> Dict[str, Any]:
             except Exception:
                 pass
 
+# ------------ WRAPPER TOLERANTE ------------
+def buscar_sbcp(*args, **kwargs) -> Dict[str, Any]:
+    """
+    Aceita várias assinaturas:
+      - buscar_sbcp(nome_busca, steps)
+      - buscar_sbcp(conn, nome_busca, steps)
+      - buscar_sbcp(conn, member_id, nome_busca, steps)
+      - buscar_sbcp(nome=..., nome_busca=..., steps=[...])
+
+    Retorna o dicionário produzido por _buscar_sbcp_core.
+    """
+    args = list(args)
+
+    # 1) descarta conexão no início
+    if args and _looks_like_connection(args[0]):
+        args.pop(0)
+
+    nome_busca = None
+    steps = None
+
+    # 2) tenta detectar padrão (member_id) como segundo arg (int/str-num)
+    def _is_intlike(x):
+        try:
+            int(str(x))
+            return True
+        except Exception:
+            return False
+
+    # Casos por posição
+    if len(args) == 1:
+        # (nome_busca)
+        nome_busca = args[0]
+    elif len(args) == 2:
+        # (nome_busca, steps) ou (member_id, nome_busca)
+        if _is_intlike(args[0]) and not _is_intlike(args[1]):
+            # (member_id, nome)
+            nome_busca = args[1]
+        else:
+            nome_busca = args[0]
+            steps = args[1]
+    elif len(args) >= 3:
+        # (member_id?, nome_busca, steps, ...)
+        if _is_intlike(args[0]):
+            nome_busca = args[1]
+            steps = args[2]
+        else:
+            nome_busca = args[0]
+            steps = args[1] if isinstance(args[1], list) else args[2] if len(args) > 2 else None
+
+    # 3) sobrescreve por kwargs se vierem
+    if "nome_busca" in kwargs and kwargs["nome_busca"]:
+        nome_busca = kwargs["nome_busca"]
+    if "nome" in kwargs and kwargs["nome"]:
+        nome_busca = kwargs["nome"]
+    if "steps" in kwargs and isinstance(kwargs["steps"], list):
+        steps = kwargs["steps"]
+
+    if steps is None:
+        steps = []
+    if nome_busca is None:
+        steps.append("wrapper: nome_busca ausente")
+        return {"ok": False, "qtd": 0, "resultados": [], "steps": steps, "reason": "nome_busca_ausente"}
+
+    steps.append(f"wrapper normalizado: nome_busca='{nome_busca}'")
+    return _buscar_sbcp_core(nome_busca=nome_busca, steps=steps)
+
 # =========================
 # CLI
 # =========================
 
 def main():
-    # argv esperados:
-    #   1: member_id (não usado aqui, só para o worker rastrear)
-    #   2: nome
-    #   3: doc (pode vir vazio)
-    #   4: email
-    #   5: timestamp ISO (não usado aqui)
+    # argv: [member_id, nome, doc, email, ts]
     member_id = None
     nome = ""
     doc = ""
     email = ""
     try:
-        if len(sys.argv) >= 2:
-            member_id = sys.argv[1]
-        if len(sys.argv) >= 3:
-            nome = sys.argv[2]
-        if len(sys.argv) >= 4:
-            doc = sys.argv[3]
-        if len(sys.argv) >= 5:
-            email = sys.argv[4]
+        if len(sys.argv) >= 2: member_id = sys.argv[1]
+        if len(sys.argv) >= 3: nome = sys.argv[2]
+        if len(sys.argv) >= 4: doc = sys.argv[3]
+        if len(sys.argv) >= 5: email = sys.argv[4]
     except Exception:
         pass
 
@@ -431,7 +445,6 @@ def main():
     result = buscar_sbcp(nome_busca=nome, steps=steps)
     result["email"] = email
     print(json.dumps(result, ensure_ascii=False))
-
 
 if __name__ == "__main__":
     main()

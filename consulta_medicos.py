@@ -1,289 +1,305 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-Consulta na SBCP com Playwright (headless) e grava o resultado no banco.
-- Sem necessidade de Chromedriver.
-- Registra passos de debug em `validations_log.payload` para diagnóstico.
-ENV esperadas:
-  DATABASE_URL     -> string de conexão Postgres (psycopg2)
-  SBCP_URL         -> opcional (default: https://cirurgiaplastica.org.br/encontre-um-cirurgiao/#busca-cirurgiao)
+consulta_medicos.py
+- Busca no site da SBCP pelo nome informado
+- Abre o primeiro resultado ("Perfil Completo")
+- Extrai dados básicos (nome, cidade, CRM, RQE, etc.)
+- Imprime um JSON com { ok, qtd, resultados, steps, timing_ms, nome_busca, email }
+- Hotfix: se o Chromium do Playwright não estiver instalado no pod, roda
+  `python -m playwright install chromium` uma vez e tenta o launch novamente.
 """
 
-import json
-import os
 import sys
+import json
 import time
-from typing import Any, Dict, List, Optional
+import traceback
+import subprocess
 
-import psycopg2
-import psycopg2.extras
-from playwright.sync_api import Playwright, TimeoutError as PWTimeout, sync_playwright
+from typing import List, Dict, Any
 
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-SBCP_URL = os.getenv(
-    "SBCP_URL",
-    "https://cirurgiaplastica.org.br/encontre-um-cirurgiao/#busca-cirurgiao",
-)
-DATABASE_URL = os.getenv("DATABASE_URL")
+SBCP_URL = "https://www.cirurgiaplastica.org.br/encontre-um-cirurgiao/#busca-cirurgiao"
+MISSING_MSG = "Executable doesn't exist"
 
 
-# ---------- util DB ----------
-def db() -> psycopg2.extensions.connection:
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL não configurada")
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.autocommit = True
-    return conn
-
-
-def log_validation(
-    conn: psycopg2.extensions.connection,
-    member_id: int,
-    fonte: str,
-    status: str,
-    payload: Dict[str, Any],
-) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO validations_log (member_id, fonte, status, payload)
-            VALUES (%s, %s, %s, %s::jsonb)
-            """,
-            (member_id, fonte, status, json.dumps(payload, ensure_ascii=False)),
+def _ensure_browsers_installed(steps: List[str]) -> bool:
+    """Tenta instalar o Chromium do Playwright em runtime (fallback).
+    Retorna True se instalou com sucesso."""
+    try:
+        steps.append("playwright install chromium (fallback em runtime)")
+        proc = subprocess.run(
+            ["python", "-m", "playwright", "install", "chromium"],
+            capture_output=True,
+            text=True,
+            timeout=300,
         )
+        steps.append(f"install rc={proc.returncode}")
+        if proc.stdout:
+            steps.append(f"install stdout: {proc.stdout[-300:]}")
+        if proc.stderr:
+            steps.append(f"install stderr: {proc.stderr[-300:]}")
+        return proc.returncode == 0
+    except Exception as e:
+        steps.append(f"install exception: {e}")
+        return False
 
 
-def set_member_validation(
-    conn: psycopg2.extensions.connection,
-    member_id: int,
-    status: str,
-    fonte: Optional[str],
-) -> None:
-    """Atualiza a linha em membersnextlevel (colunas validacao_acesso, portal_validado)."""
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE membersnextlevel
-               SET validacao_acesso = %s,
-                   portal_validado  = %s
-             WHERE id = %s
-            """,
-            (status, fonte, member_id),
-        )
-
-
-# ---------- scraping ----------
-def _try_selector(page, steps: List[str], selectors: List[str], timeout: int = 6000):
-    """Tenta uma lista de seletores até achar um existente; retorna o handle."""
-    last_err = None
+def _fill_by_many_selectors(page, steps: List[str], selectors: List[str], value: str) -> bool:
+    """Tenta localizar um input usando uma lista de seletores e preencher com value."""
     for sel in selectors:
         try:
-            steps.append(f"aguardando seletor: {sel}")
-            handle = page.wait_for_selector(sel, timeout=timeout, state="visible")
-            return handle
-        except Exception as e:
-            last_err = e
-            steps.append(f"falhou seletor: {sel} ({type(e).__name__})")
-    if last_err:
-        raise last_err
-    raise RuntimeError("Nenhum seletor válido encontrado")
+            locator = page.locator(sel)
+            locator.wait_for(timeout=5000)
+            locator.fill("")
+            locator.fill(value)
+            steps.append(f'preencheu nome em "{sel}": "{value}"')
+            return True
+        except Exception:
+            continue
+    steps.append("input de nome não encontrado por nenhum seletor candidato")
+    return False
 
 
-def _extract_modal_info(page, steps: List[str]) -> Dict[str, Any]:
-    """
-    Lê o modal 'Perfil Completo' e monta um dicionário:
-      {"nome":..., "cidade":..., "crm": "...", "crm2": "...", "rqe": "..."}
-    Estrutura do modal (observada): blocos com dt/dd.
-    """
-    steps.append("extraindo informações do modal")
-    info = page.evaluate(
-        """
-        () => {
-          const data = {};
-          // Nome no título
-          const h3 = document.querySelector('div.cirurgiao-details h3');
-          if (h3) data.nome = h3.textContent.trim();
-
-          // Cidade
-          const cidadeDT = Array.from(document.querySelectorAll('div.cirurgiao-info dt'))
-            .find(dt => dt.textContent.trim().toUpperCase().startsWith('CIDADE'));
-          if (cidadeDT) {
-            const dd = cidadeDT.nextElementSibling;
-            if (dd) data.cidade = dd.textContent.trim();
-          }
-
-          // CRM
-          const crmDT = Array.from(document.querySelectorAll('div.cirurgiao-info dt'))
-            .find(dt => dt.textContent.trim().toUpperCase().startsWith('CRM:'));
-          if (crmDT) {
-            const dd = crmDT.nextElementSibling;
-            if (dd) data.crm = dd.textContent.trim();
-          }
-
-          // CRM 2
-          const crm2DT = Array.from(document.querySelectorAll('div.cirurgiao-info dt'))
-            .find(dt => dt.textContent.trim().toUpperCase().startsWith('CRM 2'));
-          if (crm2DT) {
-            const dd = crm2DT.nextElementSibling;
-            if (dd) data.crm2 = dd.textContent.trim();
-          }
-
-          // RQE
-          const rqeDT = Array.from(document.querySelectorAll('div.cirurgiao-info dt'))
-            .find(dt => dt.textContent.trim().toUpperCase().startsWith('RQE'));
-          if (rqeDT) {
-            const dd = rqeDT.nextElementSibling;
-            if (dd) data.rqe = dd.textContent.trim();
-          }
-
-          return data;
-        }
-        """
-    )
-    return info or {}
+def _click_by_many_selectors(page, steps: List[str], selectors: List[str]) -> bool:
+    """Tenta clicar usando uma lista de seletores."""
+    for sel in selectors:
+        try:
+            btn = page.locator(sel)
+            btn.wait_for(timeout=5000)
+            btn.click()
+            steps.append(f'clicou no botão de busca via "{sel}"')
+            return True
+        except Exception:
+            continue
+    steps.append("botão de busca não encontrado por nenhum seletor candidato")
+    return False
 
 
-def buscar_sbcp(
-    member_id: int,
-    nome: str,
-    email: str,
-    steps: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    """
-    Faz a busca na SBCP e retorna dict com:
-      {
-        "ok": bool,
-        "resultados": [ {...} ],   // lista de perfis (apenas 1º detalhado)
-        "steps": [...],
-        "nome_busca": "...",
-        "email": "...",
-        "qtd": <int>,
-        "timing_ms": <int>
-      }
-    """
-    if steps is None:
-        steps = []
-    t0 = time.time()
-    payload: Dict[str, Any] = {
-        "nome_busca": nome,
-        "email": email,
-        "resultados": [],
-        "qtd": 0,
-        "steps": steps,
-    }
+def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
+    """Extrai campos do modal de perfil completo (estrutura dt/dd)."""
+    data = {}
+
+    try:
+        modal = page.locator("div.mfp-content")
+        modal.wait_for(timeout=10000)
+        steps.append("modal de perfil aberto")
+
+        # Bloco com as informações (dt/dd)
+        info = modal.locator("div.cirurgiao-info")
+        info.wait_for(timeout=8000)
+
+        dts = info.locator("dt")
+        dds = info.locator("dd")
+        count = min(dts.count(), dds.count())
+
+        for i in range(count):
+            key = dts.nth(i).inner_text().strip().strip(":")
+            val = dds.nth(i).inner_text().strip()
+            if key:
+                data[key] = val
+
+        # Alguns campos úteis para padronizar
+        # CRM principal
+        for k in ["CRM", "Crm", "crm"]:
+            if k in data and data.get("crm_padrao") is None:
+                data["crm_padrao"] = data[k]
+                break
+
+        # RQE
+        for k in ["RQE", "Rqe", "rqe"]:
+            if k in data and data.get("rqe_padrao") is None:
+                data["rqe_padrao"] = data[k]
+                break
+
+        steps.append(f"campos extraídos: {list(data.keys())}")
+
+    except PWTimeout:
+        steps.append("timeout abrindo/extraindo modal de perfil")
+    except Exception as e:
+        steps.append(f"erro extraindo perfil: {e}")
+
+    return data
+
+
+def buscar_sbcp(nome_busca: str, steps: List[str]) -> Dict[str, Any]:
+    """Fluxo de busca no site da SBCP com hotfix de instalação do Chromium."""
+    start = time.time()
+    resultados = []
+    tried_install = False
 
     with sync_playwright() as p:
         browser = None
+
+        # Hotfix: tentar abrir; se faltar o binário, instalar e tentar de novo.
+        while True:
+            try:
+                steps.append("launch chromium")
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+                break
+            except Exception as e:
+                msg = str(e)
+                steps.append(f"launch falhou: {msg}")
+                if (MISSING_MSG in msg) and (not tried_install):
+                    tried_install = True
+                    if _ensure_browsers_installed(steps):
+                        steps.append("tentando launch novamente após install")
+                        continue
+                raise  # não é caso de instalação faltando, propaga
+
+        context = browser.new_context()
+        page = context.new_page()
+
         try:
-            steps.append("launch chromium")
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-            context = browser.new_context(
-                ignore_https_errors=True,
-                java_script_enabled=True,
-                viewport={"width": 1366, "height": 900},
-            )
-            page = context.new_page()
+            steps.append(f"abrindo {SBCP_URL}")
+            page.goto(SBCP_URL, wait_until="commit", timeout=30000)
 
-            steps.append(f"abrindo URL {SBCP_URL}")
-            page.goto(SBCP_URL, wait_until="domcontentloaded", timeout=30000)
-
-            # Campo nome (tentamos múltiplos seletores)
-            nome_input = _try_selector(
+            # Preenche campo "Nome"
+            ok_input = _fill_by_many_selectors(
                 page,
                 steps,
-                [
-                    'input#cirurgiao_nome',
-                    'input[name="cirurgiao_nome"]',
-                    'input[placeholder*="Nome"]',
-                    'input[type="text"]',
+                selectors=[
+                    "input#cirurgiao_nome",
+                    "input[name='cirurgiao_nome']",
+                    "input[placeholder*='Nome']",
+                    "input[type='text']",
+                ],
+                value=nome_busca,
+            )
+            if not ok_input:
+                return {
+                    "ok": False,
+                    "qtd": 0,
+                    "resultados": [],
+                    "steps": steps,
+                    "nome_busca": nome_busca,
+                    "timing_ms": int((time.time() - start) * 1000),
+                    "reason": "input_nome_nao_encontrado",
+                }
+
+            # Clica em "Buscar"
+            ok_click = _click_by_many_selectors(
+                page,
+                steps,
+                selectors=[
+                    "input#cirurgiao_submit",
+                    "input[name='cirurgiao_submit']",
+                    "input[type='submit'][value*='Buscar']",
+                    "button:has-text('Buscar')",
+                    "text=Buscar",
                 ],
             )
-            steps.append("preenchendo nome")
-            nome_input.fill("")
-            nome_input.type(nome, delay=20)
+            if not ok_click:
+                return {
+                    "ok": False,
+                    "qtd": 0,
+                    "resultados": [],
+                    "steps": steps,
+                    "nome_busca": nome_busca,
+                    "timing_ms": int((time.time() - start) * 1000),
+                    "reason": "botao_buscar_nao_encontrado",
+                }
 
-            # Botão buscar
+            # Espera aparecer algum resultado
             try:
-                steps.append("clicando botão (input#cirurgiao_submit)")
-                page.click('input#cirurgiao_submit')
-            except Exception:
-                steps.append('fallback: clicando botão por texto "Buscar"')
-                page.get_by_role("button", name="Buscar").click()
-
-            # Espera resultados (item) OU estado de "sem resultados"
-            try:
-                steps.append("aguardando resultados (item)")
-                page.wait_for_selector("div.cirurgiao-results-item", timeout=15000)
+                page.wait_for_selector(".cirurgiao-results", timeout=15000)
+                steps.append("lista de resultados visível")
             except PWTimeout:
-                steps.append("nenhum resultado visível; tentando detectar vazio")
-                # Se não há itens, assume zero:
-                payload["qtd"] = 0
-                payload["ok"] = False
-                payload["timing_ms"] = int((time.time() - t0) * 1000)
-                return payload
+                # alguns temas não têm esse wrapper; tenta diretamente pelo item
+                steps.append("wrapper de resultados não visível; tentando pelo item")
+            # Confere se existe item
+            itens = page.locator(".cirurgiao-results-item, .div.cirurgiao-results-item, .cirurgiao-results .row, .cirurgiao-results")
+            # fallback: procurar link Perfil Completo
+            perfil_link = page.locator(".cirurgiao-perfil-link, a:has-text('Perfil Completo')")
+            if perfil_link.count() == 0:
+                # Talvez o nome já apareça como card único; tenta achar o card pelo título
+                title = page.locator("h3.cirurgiao-nome, h3:has-text('Perfil Completo')").first
+                if title:
+                    steps.append("nenhum link direto; resultados podem estar em outro contêiner")
 
-            # Abre o primeiro "Perfil Completo"
-            steps.append('clicando "Perfil Completo" do primeiro item')
-            page.click("a.cirurgiao-perfil-link")
+            # Abre o primeiro perfil
+            perfil_link = page.locator(".cirurgiao-perfil-link, a:has-text('Perfil Completo')").first
+            perfil_link.click(timeout=15000)
+            steps.append("clicou em Perfil Completo (primeiro resultado)")
 
-            steps.append("aguardando modal de perfil")
-            page.wait_for_selector("div.mfp-content", timeout=15000)
+            # Extrai as informações do modal
+            dados = _extract_profile(page, steps)
 
-            info = _extract_modal_info(page, steps)
-            if info:
-                payload["resultados"].append(info)
-                payload["qtd"] = 1
-                payload["ok"] = True
-            else:
-                payload["qtd"] = 0
-                payload["ok"] = False
+            # Nome e cidade podem estar fora do bloco dt/dd; captura por seletores extras
+            try:
+                titulo = page.locator("div.mfp-content h3.cirurgiao-nome").first.inner_text().strip()
+                if titulo:
+                    dados.setdefault("nome", titulo)
+            except Exception:
+                pass
 
-            payload["timing_ms"] = int((time.time() - t0) * 1000)
-            return payload
+            # Cidade geralmente aparece no bloco “Cidade:”
+            # Já foi mapeado por _extract_profile em data["Cidade"] se existir.
+
+            if dados:
+                resultados.append(dados)
+
+            ok = len(resultados) > 0
+            return {
+                "ok": ok,
+                "qtd": len(resultados),
+                "resultados": resultados,
+                "steps": steps,
+                "nome_busca": nome_busca,
+                "timing_ms": int((time.time() - start) * 1000),
+            }
 
         except Exception as e:
             steps.append(f"exception: {e}")
-            payload["ok"] = False
-            payload["qtd"] = 0
-            payload["timing_ms"] = int((time.time() - t0) * 1000)
-            return payload
+            steps.append(traceback.format_exc()[-800:])
+            return {
+                "ok": False,
+                "qtd": 0,
+                "resultados": [],
+                "steps": steps,
+                "nome_busca": nome_busca,
+                "timing_ms": int((time.time() - start) * 1000),
+            }
         finally:
             try:
-                if browser:
-                    browser.close()
+                context.close()
+                browser.close()
             except Exception:
                 pass
 
 
-# ---------- main CLI ----------
 def main():
-    """
-    Execução direta:
-      python consulta_medicos.py <member_id> "<nome>" "<email>"
-    """
-    if len(sys.argv) < 4:
-        print('uso: python consulta_medicos.py <member_id> "<nome>" "<email>"')
-        sys.exit(2)
-
-    member_id = int(sys.argv[1])
-    nome = sys.argv[2]
-    email = sys.argv[3]
-
+    # argv esperados:
+    #   1: member_id (não usado aqui, só para o worker rastrear)
+    #   2: nome
+    #   3: doc (pode vir vazio)
+    #   4: email
+    #   5: timestamp ISO (não usado aqui)
+    member_id = None
+    nome = ""
+    doc = ""
+    email = ""
     steps: List[str] = []
-    result = buscar_sbcp(member_id, nome, email, steps)
 
-    conn = db()
-    fonte = "sbcp"
+    try:
+        if len(sys.argv) >= 2:
+            member_id = sys.argv[1]
+        if len(sys.argv) >= 3:
+            nome = sys.argv[2]
+        if len(sys.argv) >= 4:
+            doc = sys.argv[3]
+        if len(sys.argv) >= 5:
+            email = sys.argv[4]
+    except Exception:
+        pass
 
-    # Grava log detalhado
-    status_log = "ok" if result.get("ok") else "error"
-    log_validation(conn, member_id, fonte, status_log, {"raw": result, "fonte": fonte})
+    steps.append(f"argv member_id={member_id} nome={nome} email={email}")
 
-    # Atualiza estado do membro (aprovado/recusado)
-    if result.get("ok"):
-        set_member_validation(conn, member_id, "aprovado", fonte)
-    else:
-        # mantém pendente/recusado a critério; aqui vamos marcar como "recusado"
-        set_member_validation(conn, member_id, "recusado", fonte)
+    result = buscar_sbcp(nome_busca=nome, steps=steps)
+    # agrega email ao payload para o worker ter mais contexto
+    result["email"] = email
 
     print(json.dumps(result, ensure_ascii=False))
 

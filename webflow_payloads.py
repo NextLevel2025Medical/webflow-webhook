@@ -139,18 +139,30 @@ def parse_payload(data: dict):
 # -------------------
 def enqueue_validation_job(conn, member_id: int):
     """
-    Cria um job de validação para o membro (se ainda estiver pendente).
-    Usa 'sbcp' como fonte inicial.
+    Enfileira job para o membro.
+    - Se não existe: cria PENDING.
+    - Se existe: reabre como PENDING (reset tentativas), exceto se estiver RUNNING.
+    Requer UNIQUE (member_id, fonte).
     """
     conn.execute(text("""
-        INSERT INTO validation_jobs (member_id, email, nome, fonte)
-        SELECT m.id, m.email, m.nome, 'sbcp'
+        INSERT INTO validation_jobs (member_id, email, nome, fonte, status, attempts, started_at, finished_at, last_error)
+        SELECT m.id, m.email, m.nome, 'sbcp', 'PENDING', 0, NULL, NULL, NULL
           FROM membersnextlevel m
          WHERE m.id = :mid
-           AND COALESCE(m.validacao_acesso, 'pending') = 'pending'
-        ON CONFLICT (member_id, fonte) DO NOTHING
+        ON CONFLICT (member_id, fonte) DO UPDATE
+           SET status      = CASE WHEN validation_jobs.status = 'RUNNING'
+                                  THEN validation_jobs.status   -- não mexe em RUNNING
+                                  ELSE 'PENDING'
+                             END,
+               attempts    = CASE WHEN validation_jobs.status = 'RUNNING'
+                                  THEN validation_jobs.attempts
+                                  ELSE 0
+                             END,
+               started_at  = CASE WHEN validation_jobs.status = 'RUNNING' THEN validation_jobs.started_at  ELSE NULL END,
+               finished_at = CASE WHEN validation_jobs.status = 'RUNNING' THEN validation_jobs.finished_at ELSE NULL END,
+               last_error  = CASE WHEN validation_jobs.status = 'RUNNING' THEN validation_jobs.last_error  ELSE NULL END
+        WHERE EXCLUDED.member_id = :mid
     """), {"mid": member_id})
-
 
 # -------------------
 # DB persistence (append-only + insert-only)
@@ -331,3 +343,4 @@ def webflow_webhook():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
+

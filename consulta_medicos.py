@@ -1,290 +1,291 @@
-# consulta_medicos.py
 # -*- coding: utf-8 -*-
+"""
+Consulta na SBCP com Playwright (headless) e grava o resultado no banco.
+- Sem necessidade de Chromedriver.
+- Registra passos de debug em `validations_log.payload` para diagnóstico.
+ENV esperadas:
+  DATABASE_URL     -> string de conexão Postgres (psycopg2)
+  SBCP_URL         -> opcional (default: https://cirurgiaplastica.org.br/encontre-um-cirurgiao/#busca-cirurgiao)
+"""
 
 import json
 import os
-import re
 import sys
 import time
-import unicodedata
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-
-
-SITE = "https://cirurgiaplastica.org.br/encontre-um-cirurgiao/#busca-cirurgiao"
-
-HEADLESS = True  # deixe True no Render
-NAV_TIMEOUT_MS = 45_000
-STEP_TIMEOUT_MS = 30_000
+import psycopg2
+import psycopg2.extras
+from playwright.sync_api import Playwright, TimeoutError as PWTimeout, sync_playwright
 
 
-def norm(s: str) -> str:
-    """Normaliza para comparação (sem acentos/caixa)."""
-    if not s:
-        return ""
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join([c for c in s if not unicodedata.combining(c)])
-    return s.upper().strip()
+SBCP_URL = os.getenv(
+    "SBCP_URL",
+    "https://cirurgiaplastica.org.br/encontre-um-cirurgiao/#busca-cirurgiao",
+)
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 
-def try_fill_name(page, nome: str, steps: List[str]) -> None:
-    """
-    Tenta vários seletores possíveis para o input do nome
-    (o site é WP e já mudou markup).
-    """
-    candidatos = [
-        'input#cirurgiao_nome',
-        'input[name="cirurgiao_nome"]',
-        'input[name="nome"]',
-        'input[placeholder*="Nome"]',
-        'form#cirurgiao-form input[type="text"]',
-        'form[action*="index.php"] input[type="text"]',
-    ]
-    for css in candidatos:
-        try:
-            page.locator(css).first.wait_for(timeout=STEP_TIMEOUT_MS, state="visible")
-            page.locator(css).first.fill(nome)
-            steps.append(f'preencheu nome em: {css}')
-            return
-        except PWTimeout:
-            steps.append(f'input nao encontrado: {css}')
-            continue
-    raise RuntimeError("campo_nome_nao_encontrado")
+# ---------- util DB ----------
+def db() -> psycopg2.extensions.connection:
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL não configurada")
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = True
+    return conn
 
 
-def click_buscar(page, steps: List[str]) -> None:
-    """Clica no botão Buscar (com fallback de seletores)."""
-    try:
-        page.locator('input#cirurgiao_submit').first.wait_for(timeout=STEP_TIMEOUT_MS, state="visible")
-        page.locator('input#cirurgiao_submit').first.click()
-        steps.append("clicou em: input#cirurgiao_submit")
-        return
-    except PWTimeout:
-        steps.append("nao achou input#cirurgiao_submit, tentando por role")
-        pass
-
-    # Fallback por role/nome
-    try:
-        page.get_by_role("button", name=re.compile(r"Buscar", re.I)).first.click(timeout=STEP_TIMEOUT_MS)
-        steps.append("clicou em: role=button name~Buscar")
-        return
-    except PWTimeout:
-        raise RuntimeError("botao_buscar_nao_encontrado")
-
-
-def wait_results(page, steps: List[str]) -> None:
-    """
-    Aguarda a área de resultados aparecer/atualizar.
-    Reconhece tanto container quanto link 'Perfil Completo'.
-    """
-    # Muitas vezes a página rola a lista; garanta visibilidade
-    page.wait_for_load_state("networkidle", timeout=NAV_TIMEOUT_MS)
-    try:
-        page.locator(".cirurgiao-results, .cirurgiao-results-wrapper").first.wait_for(
-            timeout=NAV_TIMEOUT_MS, state="visible"
+def log_validation(
+    conn: psycopg2.extensions.connection,
+    member_id: int,
+    fonte: str,
+    status: str,
+    payload: Dict[str, Any],
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO validations_log (member_id, fonte, status, payload)
+            VALUES (%s, %s, %s, %s::jsonb)
+            """,
+            (member_id, fonte, status, json.dumps(payload, ensure_ascii=False)),
         )
-        steps.append("container resultados visível")
-    except PWTimeout:
-        steps.append("container resultados nao visível, tentando pelo link Perfil Completo")
 
-    # De todo modo, se não houver container, o link também serve pra sinalizar resultado
-    try:
-        page.locator("a.cirurgiao-perfil-link, a:has-text('Perfil Completo')").first.wait_for(
-            timeout=NAV_TIMEOUT_MS, state="visible"
+
+def set_member_validation(
+    conn: psycopg2.extensions.connection,
+    member_id: int,
+    status: str,
+    fonte: Optional[str],
+) -> None:
+    """Atualiza a linha em membersnextlevel (colunas validacao_acesso, portal_validado)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE membersnextlevel
+               SET validacao_acesso = %s,
+                   portal_validado  = %s
+             WHERE id = %s
+            """,
+            (status, fonte, member_id),
         )
-        steps.append("link Perfil Completo visível")
-    except PWTimeout:
-        # pode ser lista vazia – deixamos seguir, será tratado no clique
-        steps.append("link Perfil Completo nao visível (possível lista vazia)")
 
 
-def click_perfil(page, nome_alvo: str, steps: List[str]) -> bool:
-    """
-    Clica no link Perfil Completo. Se houver múltiplos, tenta
-    o que estiver dentro de um card contendo o nome alvo.
-    Retorna True se clicou em algum perfil.
-    """
-    link_sel = "a.cirurgiao-perfil-link, a:has-text('Perfil Completo')"
-
-    # 1) Tentar card com o nome
-    try:
-        card = page.locator(".cirurgiao-results-item, .cirurgiao-results, .cirurgiao-resultado, .cirurgiao-results-row") \
-                  .filter(has_text=re.compile(re.escape(nome_alvo), re.I)).first
-        if card.count() > 0:
-            card.locator(link_sel).first.click(timeout=STEP_TIMEOUT_MS)
-            steps.append("clicou Perfil Completo no card do nome")
-            return True
-    except PWTimeout:
-        steps.append("nao conseguiu clicar no perfil do card com o nome")
-
-    # 2) Fallback: primeiro Perfil Completo da lista
-    try:
-        page.locator(link_sel).first.click(timeout=STEP_TIMEOUT_MS)
-        steps.append("clicou no primeiro Perfil Completo")
-        return True
-    except PWTimeout:
-        steps.append("nenhum Perfil Completo clicável encontrado")
-        return False
-
-
-def extract_modal_info(page, steps: List[str]) -> Dict[str, str]:
-    """
-    No modal (magnific-popup), extrai os pares dt/dd
-    e retorna dict com campos úteis.
-    """
-    # Espera o modal
-    try:
-        page.locator(".mfp-content").first.wait_for(timeout=STEP_TIMEOUT_MS, state="visible")
-        steps.append("modal aberto")
-    except PWTimeout:
-        raise RuntimeError("modal_nao_abriu")
-
-    # Mapear dt -> dd
-    dts = page.locator(".mfp-content dt")
-    dds = page.locator(".mfp-content dd")
-
-    info = {}
-    try:
-        n = dts.count()
-    except Exception:
-        n = 0
-
-    for i in range(n):
+# ---------- scraping ----------
+def _try_selector(page, steps: List[str], selectors: List[str], timeout: int = 6000):
+    """Tenta uma lista de seletores até achar um existente; retorna o handle."""
+    last_err = None
+    for sel in selectors:
         try:
-            k = dts.nth(i).inner_text().strip().rstrip(":")
-            v = dds.nth(i).inner_text().strip()
-            info[k] = v
-        except Exception:
-            # ignorar pares quebrados
-            pass
-
-    steps.append(f"coletou_campos: {list(info.keys())}")
-
-    # Normaliza chaves de interesse
-    result = {
-        "cidade": info.get("Cidade", ""),
-        "categoria": info.get("Categoria", ""),
-        "crm": info.get("CRM", ""),
-        "crm2": info.get("CRM 2", ""),
-        "rqe": info.get("RQE", ""),
-    }
-    return result
+            steps.append(f"aguardando seletor: {sel}")
+            handle = page.wait_for_selector(sel, timeout=timeout, state="visible")
+            return handle
+        except Exception as e:
+            last_err = e
+            steps.append(f"falhou seletor: {sel} ({type(e).__name__})")
+    if last_err:
+        raise last_err
+    raise RuntimeError("Nenhum seletor válido encontrado")
 
 
-def buscar_sbcp(nome: str, email: str, steps: List[str]) -> Dict:
-    inicio = time.time()
-    resultados: List[Dict] = []
-
-    with sync_playwright() as p:
-        steps.append("launch chromium…")
-        browser = p.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-gpu",
-                "--disable-dev-shm-usage",
-                "--disable-features=TranslateUI",
-                "--disable-extensions",
-            ],
-        )
-        context = browser.new_context()
-        page = context.new_page()
-
-        try:
-            page.goto(SITE, timeout=NAV_TIMEOUT_MS, wait_until="domcontentloaded")
-            steps.append("abriu pagina de busca")
-
-            try_fill_name(page, nome, steps)
-            click_buscar(page, steps)
-            wait_results(page, steps)
-
-            # Verifica se há resultados
-            if not click_perfil(page, nome, steps):
-                steps.append("nenhum perfil clicável após busca")
-                return {
-                    "qtd": 0,
-                    "email": email,
-                    "nome_busca": nome,
-                    "resultados": resultados,
-                }
-
-            # Extrair dados do modal
-            info = extract_modal_info(page, steps)
-            resultados.append(
-                {
-                    "nome": nome,
-                    "email": email,
-                    **info,
-                }
-            )
-
-            return {
-                "qtd": len(resultados),
-                "email": email,
-                "nome_busca": nome,
-                "resultados": resultados,
-            }
-
-        finally:
-            try:
-                context.close()
-            except Exception:
-                pass
-            try:
-                browser.close()
-            except Exception:
-                pass
-
-
-def main():
+def _extract_modal_info(page, steps: List[str]) -> Dict[str, Any]:
     """
-    Aceita:
-      argv[1] = member_id (ignorado aqui, mas mantido p/ compat)
-      argv[2] = nome
-      argv[3] = telefone (opcional/ignorado)
-      argv[4] = email
-      argv[5] = timestamp (opcional)
-    Imprime JSON com:
+    Lê o modal 'Perfil Completo' e monta um dicionário:
+      {"nome":..., "cidade":..., "crm": "...", "crm2": "...", "rqe": "..."}
+    Estrutura do modal (observada): blocos com dt/dd.
+    """
+    steps.append("extraindo informações do modal")
+    info = page.evaluate(
+        """
+        () => {
+          const data = {};
+          // Nome no título
+          const h3 = document.querySelector('div.cirurgiao-details h3');
+          if (h3) data.nome = h3.textContent.trim();
+
+          // Cidade
+          const cidadeDT = Array.from(document.querySelectorAll('div.cirurgiao-info dt'))
+            .find(dt => dt.textContent.trim().toUpperCase().startsWith('CIDADE'));
+          if (cidadeDT) {
+            const dd = cidadeDT.nextElementSibling;
+            if (dd) data.cidade = dd.textContent.trim();
+          }
+
+          // CRM
+          const crmDT = Array.from(document.querySelectorAll('div.cirurgiao-info dt'))
+            .find(dt => dt.textContent.trim().toUpperCase().startsWith('CRM:'));
+          if (crmDT) {
+            const dd = crmDT.nextElementSibling;
+            if (dd) data.crm = dd.textContent.trim();
+          }
+
+          // CRM 2
+          const crm2DT = Array.from(document.querySelectorAll('div.cirurgiao-info dt'))
+            .find(dt => dt.textContent.trim().toUpperCase().startsWith('CRM 2'));
+          if (crm2DT) {
+            const dd = crm2DT.nextElementSibling;
+            if (dd) data.crm2 = dd.textContent.trim();
+          }
+
+          // RQE
+          const rqeDT = Array.from(document.querySelectorAll('div.cirurgiao-info dt'))
+            .find(dt => dt.textContent.trim().toUpperCase().startsWith('RQE'));
+          if (rqeDT) {
+            const dd = rqeDT.nextElementSibling;
+            if (dd) data.rqe = dd.textContent.trim();
+          }
+
+          return data;
+        }
+        """
+    )
+    return info or {}
+
+
+def buscar_sbcp(
+    member_id: int,
+    nome: str,
+    email: str,
+    steps: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Faz a busca na SBCP e retorna dict com:
       {
-        "status": "ok"|"error",
-        "fonte": "sbcp",
-        "raw": { ... debug, resultados ... }
+        "ok": bool,
+        "resultados": [ {...} ],   // lista de perfis (apenas 1º detalhado)
+        "steps": [...],
+        "nome_busca": "...",
+        "email": "...",
+        "qtd": <int>,
+        "timing_ms": <int>
       }
     """
+    if steps is None:
+        steps = []
+    t0 = time.time()
+    payload: Dict[str, Any] = {
+        "nome_busca": nome,
+        "email": email,
+        "resultados": [],
+        "qtd": 0,
+        "steps": steps,
+    }
+
+    with sync_playwright() as p:
+        browser = None
+        try:
+            steps.append("launch chromium")
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+            context = browser.new_context(
+                ignore_https_errors=True,
+                java_script_enabled=True,
+                viewport={"width": 1366, "height": 900},
+            )
+            page = context.new_page()
+
+            steps.append(f"abrindo URL {SBCP_URL}")
+            page.goto(SBCP_URL, wait_until="domcontentloaded", timeout=30000)
+
+            # Campo nome (tentamos múltiplos seletores)
+            nome_input = _try_selector(
+                page,
+                steps,
+                [
+                    'input#cirurgiao_nome',
+                    'input[name="cirurgiao_nome"]',
+                    'input[placeholder*="Nome"]',
+                    'input[type="text"]',
+                ],
+            )
+            steps.append("preenchendo nome")
+            nome_input.fill("")
+            nome_input.type(nome, delay=20)
+
+            # Botão buscar
+            try:
+                steps.append("clicando botão (input#cirurgiao_submit)")
+                page.click('input#cirurgiao_submit')
+            except Exception:
+                steps.append('fallback: clicando botão por texto "Buscar"')
+                page.get_by_role("button", name="Buscar").click()
+
+            # Espera resultados (item) OU estado de "sem resultados"
+            try:
+                steps.append("aguardando resultados (item)")
+                page.wait_for_selector("div.cirurgiao-results-item", timeout=15000)
+            except PWTimeout:
+                steps.append("nenhum resultado visível; tentando detectar vazio")
+                # Se não há itens, assume zero:
+                payload["qtd"] = 0
+                payload["ok"] = False
+                payload["timing_ms"] = int((time.time() - t0) * 1000)
+                return payload
+
+            # Abre o primeiro "Perfil Completo"
+            steps.append('clicando "Perfil Completo" do primeiro item')
+            page.click("a.cirurgiao-perfil-link")
+
+            steps.append("aguardando modal de perfil")
+            page.wait_for_selector("div.mfp-content", timeout=15000)
+
+            info = _extract_modal_info(page, steps)
+            if info:
+                payload["resultados"].append(info)
+                payload["qtd"] = 1
+                payload["ok"] = True
+            else:
+                payload["qtd"] = 0
+                payload["ok"] = False
+
+            payload["timing_ms"] = int((time.time() - t0) * 1000)
+            return payload
+
+        except Exception as e:
+            steps.append(f"exception: {e}")
+            payload["ok"] = False
+            payload["qtd"] = 0
+            payload["timing_ms"] = int((time.time() - t0) * 1000)
+            return payload
+        finally:
+            try:
+                if browser:
+                    browser.close()
+            except Exception:
+                pass
+
+
+# ---------- main CLI ----------
+def main():
+    """
+    Execução direta:
+      python consulta_medicos.py <member_id> "<nome>" "<email>"
+    """
+    if len(sys.argv) < 4:
+        print('uso: python consulta_medicos.py <member_id> "<nome>" "<email>"')
+        sys.exit(2)
+
+    member_id = int(sys.argv[1])
+    nome = sys.argv[2]
+    email = sys.argv[3]
+
     steps: List[str] = []
-    try:
-        # Parse argumentos de forma tolerante
-        argv = sys.argv
-        member_id = argv[1] if len(argv) > 1 else ""
-        nome = argv[2] if len(argv) > 2 else ""
-        email = argv[4] if len(argv) > 4 else (argv[3] if len(argv) > 3 else "")
+    result = buscar_sbcp(member_id, nome, email, steps)
 
-        if not nome:
-            raise RuntimeError("param_nome_ausente")
+    conn = db()
+    fonte = "sbcp"
 
-        payload = buscar_sbcp(nome=nome, email=email, steps=steps)
-        payload["debug"] = {"steps": steps}
-        payload["timing_ms"] = int((time.time() - (time.time() - 0)) * 1000)  # placeholder simples
+    # Grava log detalhado
+    status_log = "ok" if result.get("ok") else "error"
+    log_validation(conn, member_id, fonte, status_log, {"raw": result, "fonte": fonte})
 
-        out = {
-            "status": "ok",
-            "fonte": "sbcp",
-            "raw": payload,
-        }
-        print(json.dumps(out, ensure_ascii=False))
-    except Exception as e:
-        out = {
-            "status": "error",
-            "fonte": "sbcp",
-            "reason": str(e),
-            "raw": {
-                "qtd": 0,
-                "resultados": [],
-                "debug": {"steps": steps},
-            },
-        }
-        print(json.dumps(out, ensure_ascii=False))
+    # Atualiza estado do membro (aprovado/recusado)
+    if result.get("ok"):
+        set_member_validation(conn, member_id, "aprovado", fonte)
+    else:
+        # mantém pendente/recusado a critério; aqui vamos marcar como "recusado"
+        set_member_validation(conn, member_id, "recusado", fonte)
+
+    print(json.dumps(result, ensure_ascii=False))
 
 
 if __name__ == "__main__":

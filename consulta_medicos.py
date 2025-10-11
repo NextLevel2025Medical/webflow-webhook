@@ -8,11 +8,12 @@ consulta_medicos.py
 - Emite JSON em stdout com { ok, qtd, resultados, steps, timing_ms, nome_busca, email }.
 - Hotfix: se o Chromium não estiver disponível, instala em runtime (playwright install chromium).
 
-Também expõe shims p/ o worker:
+Exponde para o worker:
+- buscar_sbcp(*args, **kwargs)  -> usa só o NOME (ignora extras)
 - log_validation(...)
 - set_member_validation(...)
 
-Ambiente:
+Environment:
   - DATABASE_URL (ou NEON_DATABASE_URL) com URL do Postgres.
 """
 
@@ -24,11 +25,9 @@ import traceback
 import subprocess
 from typing import List, Dict, Any, Optional
 
-# --- DB (compat com worker_validation.py) ---
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-# --- Playwright ---
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 SBCP_URL = "https://www.cirurgiaplastica.org.br/encontre-um-cirurgiao/#busca-cirurgiao"
@@ -41,7 +40,6 @@ MISSING_MSG = "Executable doesn't exist"
 _engine_cache: Optional[Engine] = None
 
 def _get_engine() -> Engine:
-    """Cria (e cacheia) o engine SQLAlchemy a partir da env var."""
     global _engine_cache
     if _engine_cache is None:
         db_url = os.environ.get("DATABASE_URL") or os.environ.get("NEON_DATABASE_URL")
@@ -51,7 +49,6 @@ def _get_engine() -> Engine:
     return _engine_cache
 
 def _looks_like_connection(obj) -> bool:
-    """Detecta se obj parece ser uma conexão (psycopg2/asyncpg) passada por engano como 1º argumento."""
     try:
         name = obj.__class__.__name__.lower()
         mod  = obj.__class__.__module__.lower()
@@ -60,27 +57,16 @@ def _looks_like_connection(obj) -> bool:
         return False
 
 def log_validation(*args, **kwargs) -> None:
-    """
-    Aceita:
-      - log_validation(member_id, fonte, status, payload[, ...])
-      - log_validation(conn, member_id, fonte, status, payload[, ...])
-      - via kwargs (member_id=, fonte=, status=, payload=, steps=, reason=, ...)
-    Extras vão para payload["extra"].
-    """
     engine = _get_engine()
     args = list(args)
-
-    # Ignora conexão passada por engano
     if args and _looks_like_connection(args[0]):
         args.pop(0)
 
-    # Extrai campos
     member_id = args[0] if len(args) > 0 else kwargs.pop("member_id", None)
     fonte     = args[1] if len(args) > 1 else kwargs.pop("fonte", None)
     status    = args[2] if len(args) > 2 else kwargs.pop("status", None)
     payload   = args[3] if len(args) > 3 else kwargs.pop("payload", None)
 
-    # Normaliza payload
     if payload is None:
         payload = {}
     elif not isinstance(payload, dict):
@@ -89,7 +75,6 @@ def log_validation(*args, **kwargs) -> None:
         except Exception:
             payload = {"value": str(payload)}
 
-    # Extras
     extra: Dict[str, Any] = {}
     if len(args) > 4:
         extra["args"] = [repr(a) for a in args[4:]]
@@ -98,7 +83,6 @@ def log_validation(*args, **kwargs) -> None:
     if extra:
         payload["extra"] = extra
 
-    # member_id seguro
     try:
         member_id_int = int(member_id) if member_id is not None else None
     except Exception:
@@ -123,14 +107,7 @@ def log_validation(*args, **kwargs) -> None:
         )
 
 def set_member_validation(*args, **kwargs) -> None:
-    """
-    Aceita:
-      - set_member_validation(member_id, status, fonte, last_error=None)
-      - set_member_validation(conn, member_id, status, fonte, last_error=None)
-      - via kwargs idem.
-    """
     engine = _get_engine()
-
     args = list(args)
     if args and _looks_like_connection(args[0]):
         args.pop(0)
@@ -147,7 +124,6 @@ def set_member_validation(*args, **kwargs) -> None:
 
     params = {"member_id": member_id_int, "status": status, "fonte": fonte, "last_error": last_error}
 
-    # Tenta com last_error; se coluna inexistir, faz fallback
     try:
         with engine.begin() as conn:
             conn.execute(
@@ -177,7 +153,6 @@ def set_member_validation(*args, **kwargs) -> None:
 # =========================
 
 def _ensure_browsers_installed(steps: List[str]) -> bool:
-    """Fallback: baixa Chromium do Playwright em runtime (no dyno/pod)."""
     try:
         steps.append("playwright install chromium (fallback em runtime)")
         proc = subprocess.run(
@@ -197,7 +172,6 @@ def _ensure_browsers_installed(steps: List[str]) -> bool:
         return False
 
 def _fill_by_many_selectors(page, steps: List[str], selectors: List[str], value: str) -> bool:
-    """Tenta localizar um input usando uma lista de seletores e preencher com 'value'."""
     for sel in selectors:
         try:
             locator = page.locator(sel)
@@ -212,7 +186,6 @@ def _fill_by_many_selectors(page, steps: List[str], selectors: List[str], value:
     return False
 
 def _click_by_many_selectors(page, steps: List[str], selectors: List[str]) -> bool:
-    """Tenta clicar usando uma lista de seletores."""
     for sel in selectors:
         try:
             btn = page.locator(sel)
@@ -226,35 +199,46 @@ def _click_by_many_selectors(page, steps: List[str], selectors: List[str]) -> bo
     return False
 
 def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
-    """Extrai campos do modal de perfil completo (estrutura dt/dd)."""
+    """
+    Extrai campos do modal de perfil completo.
+    Corrige strict mode: há vários .cirurgiao-info; vamos iterar sobre TODOS.
+    """
     data: Dict[str, Any] = {}
     try:
-        modal = page.locator("div.mfp-content")
-        modal.wait_for(timeout=10000)
+        # aguarda o modal visível
+        modal = page.locator("div.mfp-content").first
+        modal.wait_for(timeout=15000, state="visible")
         steps.append("modal de perfil aberto")
 
-        info = modal.locator("div.cirurgiao-info")
-        info.wait_for(timeout=8000)
-
-        dts = info.locator("dt")
-        dds = info.locator("dd")
-        count = min(dts.count(), dds.count())
-
-        for i in range(count):
-            key = dts.nth(i).inner_text().strip().strip(":")
-            val = dds.nth(i).inner_text().strip()
-            if key:
-                data[key] = val
-
-        # Nome (topo do modal)
+        # 1) tenta ler o nome do topo (se existir)
         try:
-            titulo = modal.locator("h3.cirurgiao-nome").first.inner_text().strip()
-            if titulo:
-                data.setdefault("nome", titulo)
+            titulo = modal.locator("h3.cirurgiao-nome").first
+            titulo.wait_for(timeout=3000)
+            nome_topo = titulo.inner_text().strip()
+            if nome_topo:
+                data.setdefault("nome", nome_topo)
         except Exception:
             pass
 
-        # Normalizações triviais
+        # 2) itera sobre todos os blocos .cirurgiao-info
+        infos = modal.locator("div.cirurgiao-info")
+        total_infos = infos.count()
+        steps.append(f"blocos cirurgiao-info encontrados: {total_infos}")
+        for j in range(total_infos):
+            section = infos.nth(j)
+            try:
+                dts = section.locator("dt")
+                dds = section.locator("dd")
+                n = min(dts.count(), dds.count())
+                for i in range(n):
+                    key = dts.nth(i).inner_text().strip().strip(":")
+                    val = dds.nth(i).inner_text().strip()
+                    if key:
+                        data[key] = val
+            except Exception as e:
+                steps.append(f"erro extraindo seção {j}: {e}")
+
+        # Normalizações simples
         for k in ("CRM", "Crm", "crm"):
             if k in data and "crm_padrao" not in data:
                 data["crm_padrao"] = data[k]
@@ -272,15 +256,12 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
     return data
 
 def _buscar_sbcp_core(nome_busca: str, steps: List[str]) -> Dict[str, Any]:
-    """Implementação real da busca (Playwright)."""
     start = time.time()
     resultados: List[Dict[str, Any]] = []
     tried_install = False
 
     with sync_playwright() as p:
         browser = None
-
-        # Launch com hotfix de instalação
         while True:
             try:
                 steps.append("launch chromium")
@@ -298,15 +279,12 @@ def _buscar_sbcp_core(nome_busca: str, steps: List[str]) -> Dict[str, Any]:
 
         context = browser.new_context()
         page = context.new_page()
-
         try:
             steps.append(f"abrindo {SBCP_URL}")
             page.goto(SBCP_URL, wait_until="commit", timeout=30000)
 
-            # Preenche campo "Nome"
             ok_input = _fill_by_many_selectors(
-                page,
-                steps,
+                page, steps,
                 selectors=[
                     "input#cirurgiao_nome",
                     "input[name='cirurgiao_nome']",
@@ -316,16 +294,12 @@ def _buscar_sbcp_core(nome_busca: str, steps: List[str]) -> Dict[str, Any]:
                 value=nome_busca,
             )
             if not ok_input:
-                return {
-                    "ok": False, "qtd": 0, "resultados": [], "steps": steps,
-                    "nome_busca": nome_busca, "timing_ms": int((time.time() - start) * 1000),
-                    "reason": "input_nome_nao_encontrado",
-                }
+                return {"ok": False, "qtd": 0, "resultados": [], "steps": steps,
+                        "nome_busca": nome_busca, "timing_ms": int((time.time()-start)*1000),
+                        "reason": "input_nome_nao_encontrado"}
 
-            # Clica em "Buscar"
             ok_click = _click_by_many_selectors(
-                page,
-                steps,
+                page, steps,
                 selectors=[
                     "input#cirurgiao_submit",
                     "input[name='cirurgiao_submit']",
@@ -335,25 +309,30 @@ def _buscar_sbcp_core(nome_busca: str, steps: List[str]) -> Dict[str, Any]:
                 ],
             )
             if not ok_click:
-                return {
-                    "ok": False, "qtd": 0, "resultados": [], "steps": steps,
-                    "nome_busca": nome_busca, "timing_ms": int((time.time() - start) * 1000),
-                    "reason": "botao_buscar_nao_encontrado",
-                }
+                return {"ok": False, "qtd": 0, "resultados": [], "steps": steps,
+                        "nome_busca": nome_busca, "timing_ms": int((time.time()-start)*1000),
+                        "reason": "botao_buscar_nao_encontrado"}
 
-            # Espera resultado e abre o primeiro "Perfil Completo"
+            # espera wrapper de resultados aparecer (se existir)
             try:
                 page.wait_for_selector(".cirurgiao-results", timeout=15000)
                 steps.append("lista de resultados visível")
             except PWTimeout:
                 steps.append("wrapper de resultados não visível; prosseguindo")
 
+            # abre o primeiro "Perfil Completo"
             perfil_link = page.locator(".cirurgiao-perfil-link, a:has-text('Perfil Completo')").first
-            perfil_link.wait_for(timeout=15000)
+            perfil_link.wait_for(timeout=15000, state="visible")
             perfil_link.click()
             steps.append("clicou em Perfil Completo (primeiro resultado)")
 
-            # Extrai informações do modal
+            # Aguarda modal ficar visível antes de extrair
+            try:
+                page.wait_for_selector("div.mfp-content", timeout=15000, state="visible")
+                steps.append("modal visível (mfp-content)")
+            except PWTimeout:
+                steps.append("timeout esperando modal (mfp-content) visível")
+
             dados = _extract_profile(page, steps)
             if dados:
                 resultados.append(dados)
@@ -389,18 +368,12 @@ def _buscar_sbcp_core(nome_busca: str, steps: List[str]) -> Dict[str, Any]:
 # ------------ WRAPPER ULTRA-TOLERANTE ------------
 def buscar_sbcp(*args, **kwargs) -> Dict[str, Any]:
     """
-    Aceita qualquer assinatura (ex.: conn, member_id, nome, steps) e
-    usa SOMENTE o NOME (string não numérica). `steps` é opcional.
-    Também aceita kwargs: nome / nome_busca / steps.
+    Aceita qualquer assinatura e usa SOMENTE o NOME (string não numérica).
+    steps (list) é opcional. Também aceita kwargs: nome / nome_busca / steps.
     """
-    # 1) pega valores por kwargs (se existirem)
     nome = kwargs.get("nome") or kwargs.get("nome_busca")
     steps = kwargs.get("steps")
 
-    # 2) varre args posicionais e extrai:
-    #    - ignora conexões;
-    #    - primeira list como steps (se steps None);
-    #    - primeira string não numérica como nome.
     def _is_intlike(x):
         try:
             int(str(x))
@@ -411,32 +384,20 @@ def buscar_sbcp(*args, **kwargs) -> Dict[str, Any]:
     for a in args:
         if _looks_like_connection(a):
             continue
-
         if steps is None and isinstance(a, list):
             steps = a
             continue
-
         if isinstance(a, str) and a.strip():
             s = a.strip()
             if not _is_intlike(s) and nome is None:
                 nome = s
                 continue
 
-        # ignora ints, dicts, etc.
-        continue
-
     if steps is None:
         steps = []
-
     if not nome:
         steps.append("nome_busca_ausente (buscar_sbcp ignorou args extras)")
-        return {
-            "ok": False,
-            "qtd": 0,
-            "resultados": [],
-            "steps": steps,
-            "reason": "nome_busca_ausente"
-        }
+        return {"ok": False, "qtd": 0, "resultados": [], "steps": steps, "reason": "nome_busca_ausente"}
 
     steps.append(f"wrapper: usando apenas nome='{nome}' (args extras ignorados)")
     return _buscar_sbcp_core(nome_busca=nome, steps=steps)
@@ -446,7 +407,7 @@ def buscar_sbcp(*args, **kwargs) -> Dict[str, Any]:
 # =========================
 
 def main():
-    # argv esperados do worker: [member_id, nome, doc, email, ts]
+    # argv: [member_id, nome, doc, email, ts]
     member_id = None
     nome = ""
     doc = ""

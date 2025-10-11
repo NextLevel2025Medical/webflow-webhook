@@ -1,33 +1,18 @@
 # consulta_medicos.py
 # Playwright headless + fallback de instalação do Chromium em runtime.
-# NÃO grava no banco — apenas imprime JSON. O worker consome esse JSON.
+# Compatível com:
+#   - uso como função (import buscar_sbcp)
+#   - uso via CLI (imprime JSON no stdout para o worker consumir)
 #
-# Uso local:
-#   python consulta_medicos.py 1364 "GUSTAVO AQUINO" "" "drgustavoaquino@yahoo.com.br" "2025-10-11T00:00:00Z"
-#
-# Saída (exemplo):
-# {
-#   "status": "ok" | "not_found" | "error",
-#   "fonte": "sbcp",
-#   "reason": "...(se houver)...",
-#   "raw": {
-#       "member_id": 1364,
-#       "nome_busca": "GUSTAVO AQUINO",
-#       "email": "drgustavoaquino@yahoo.com.br",
-#       "qtd": 1,
-#       "resultados": [],
-#       "timing_ms": 2310,
-#       "tried_install": true,
-#       "debug": { "steps": ["...", "..."] }
-#   }
-# }
+# Exemplo CLI:
+#   python consulta_medicos.py 1364 "GUSTAVO AQUINO" "" "dr@exemplo.com" "2025-10-11T00:00:00Z"
 
 import os
 import sys
 import json
 import subprocess
 from time import perf_counter
-from typing import Dict, List
+from typing import Dict, List, Optional
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 URL = "https://www.cirurgiaplastica.org.br/encontre-um-cirurgiao/#busca-cirurgiao"
@@ -63,12 +48,17 @@ def _ensure_browser_once(steps: List[str]) -> bool:
 
 
 # ---------------- automação SBCP ----------------
-def buscar_sbcp(nome: str, email: str, steps: List[str]) -> Dict:
+def buscar_sbcp(nome: str, email: str = "", steps: Optional[List[str]] = None) -> Dict:
     """
     1) Tenta abrir o Chromium. Se faltar binário, instala e tenta novamente (1x).
     2) Abre a página, preenche o nome, clica em 'Buscar'.
     3) Considera 'ok' se aparecer ao menos um 'Perfil Completo' na listagem.
+    Retorna dict com 'status', 'qtd' e logs em steps.
     """
+    if steps is None:
+        steps = []
+
+    # preferir cache do Render (evita baixar em cada boot)
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/opt/render/.cache/ms-playwright")
     headless = os.getenv("PLAYWRIGHT_HEADLESS", "1") != "0"
     tried_install = False
@@ -105,7 +95,7 @@ def buscar_sbcp(nome: str, email: str, steps: List[str]) -> Dict:
 
                 btn_buscar.click()
 
-                # pequeno aguardo para a listagem aparecida
+                # pequeno aguardo para a listagem renderizar
                 page.wait_for_timeout(1200)
 
                 _log(steps, "aguardando resultados (Perfil Completo)…")
@@ -138,12 +128,13 @@ def buscar_sbcp(nome: str, email: str, steps: List[str]) -> Dict:
             res2 = _run_once()
             res2["tried_install"] = tried_install
             return res2
-        raise  # outros erros sobem
+        # outros erros sobem para quem chamou
+        raise
 
 
 # ---------------- main/CLI ----------------
 def main():
-    # Aceita os 5 args que o worker envia, mas só usa member_id, nome, email
+    # Aceita 5 args do worker, mas só usa member_id, nome, email
     #   argv[1]=member_id  argv[2]=nome  argv[3]=celular  argv[4]=email  argv[5]=created_at
     member_id = None
     nome = ""
@@ -171,10 +162,10 @@ def main():
             "nome_busca": nome,
             "email": email,
             "qtd": res.get("qtd", 0),
-            "resultados": [],                # não expandimos cartões/links; suficiente p/ validação
+            "resultados": [],                 # não expandimos cartões/links; suficiente p/ validação
             "timing_ms": int((t1 - t0) * 1000),
             "tried_install": bool(res.get("tried_install", False)),
-            "debug": {"steps": steps[-150:]},  # limita o tamanho do log salvo no DB
+            "debug": {"steps": steps[-150:]}, # limita tamanho do log salvo no DB
         }
 
         out = {
@@ -183,6 +174,7 @@ def main():
             "raw": payload
         }
         print(json.dumps(out, ensure_ascii=False))
+
     except Exception as e:
         t1 = perf_counter()
         out = {
@@ -201,8 +193,7 @@ def main():
             },
         }
         print(json.dumps(out, ensure_ascii=False))
-        # retorna código 0 mesmo em erro, para o worker sempre capturar o JSON
-        # (o controle de retry/failed acontece no worker)
+        # mesmo em erro retornamos JSON; o worker decide retry/failed
 
 if __name__ == "__main__":
     main()

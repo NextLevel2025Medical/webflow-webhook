@@ -78,65 +78,54 @@ def claim_job(conn):
     return row
 
 
-def finalize_job(conn, job_id: int, member_id: int, status: str, payload: Dict[str, Any]):
+def finalize_job(conn, job_id: int, member_id: int, status: str, payload: dict):
     """
-    Finaliza job como DONE/FAILED e grava log + atualiza membro.
-    status: 'ok' | 'not_found' | 'error'
+    status vindo do runner: 'ok' | 'not_found' | 'error'
+    Grava no banco usando: 'aprovado' | 'pendente' | 'recusado'
     """
     payload_json = json.dumps(payload or {}, ensure_ascii=False)
+    fonte = payload.get("fonte", "sbcp")
 
-    # Atualiza membro conforme resultado
+    # Map do resultado técnico -> status do seu schema
     if status == "ok":
-        conn.execute(text("""
-            UPDATE membersnextlevel
-               SET validacao_acesso='ok',
-                   portal_validado=:fonte,
-                   validacao_at=now()
-             WHERE id=:member_id
-        """), {"member_id": member_id, "fonte": payload.get("fonte", FONTE_DEFAULT)})
-
+        novo_status = "aprovado"
     elif status == "not_found":
-        conn.execute(text("""
-            UPDATE membersnextlevel
-               SET validacao_acesso='not_found',
-                   portal_validado=:fonte,
-                   validacao_at=now()
-             WHERE id=:member_id
-        """), {"member_id": member_id, "fonte": payload.get("fonte", FONTE_DEFAULT)})
-
+        novo_status = "recusado"
     else:
-        # erro transitório: mantém 'pending' para futuros reprocessos manuais/novos jobs
-        # (dependendo da sua política, você pode marcar explicitamente 'error' aqui)
-        conn.execute(text("""
-            UPDATE membersnextlevel
-               SET validacao_acesso='pending',
-                   portal_validado=:fonte
-             WHERE id=:member_id
-        """), {"member_id": member_id, "fonte": payload.get("fonte", FONTE_DEFAULT)})
+        novo_status = "pendente"     # erro transitório -> mantém pendente
 
-    # Log detalhado
+    # Atualiza membro
+    conn.execute(text("""
+        UPDATE membersnextlevel
+           SET validacao_acesso = :novo_status,
+               portal_validado  = :fonte,
+               validacao_at     = now()
+         WHERE id = :member_id
+    """), {"novo_status": novo_status, "fonte": fonte, "member_id": member_id})
+
+    # Log
     conn.execute(text("""
         INSERT INTO validations_log (member_id, fonte, status, payload)
         VALUES (:member_id, :fonte, :status, :payload::jsonb)
     """), {
         "member_id": member_id,
-        "fonte": payload.get("fonte", FONTE_DEFAULT),
-        "status": status,
+        "fonte": fonte,
+        "status": status,        # mantenha o status técnico no log
         "payload": payload_json
     })
 
-    new_status = "DONE" if status in ("ok", "not_found") else "FAILED"
+    # Finaliza o job
+    new_job_status = "DONE" if status in ("ok", "not_found") else "FAILED"
     conn.execute(text("""
         UPDATE validation_jobs
-           SET status=:new_status,
-               finished_at=now(),
-               last_error = CASE WHEN :new_status='FAILED' THEN :err ELSE NULL END
-         WHERE id=:id
-    """), {"new_status": new_status, "err": payload_json if new_status=="FAILED" else None, "id": job_id})
+           SET status = :new_status,
+               finished_at = now(),
+               last_error  = CASE WHEN :new_status='FAILED' THEN :err ELSE NULL END
+         WHERE id = :id
+    """), {"new_status": new_job_status, "err": payload_json if new_job_status=="FAILED" else None, "id": job_id})
 
     if VERBOSE_LOG:
-        print(f"✅ Job {job_id} -> {new_status.upper()} ({status})", flush=True)
-
+        print(f"✅ Job {job_id} -> {new_job_status.upper()} (membro {member_id}: {novo_status}/{fonte})", flush=True)
 
 def retry_or_fail(conn, job_row):
     """

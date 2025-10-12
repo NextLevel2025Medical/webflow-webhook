@@ -22,8 +22,8 @@ from typing import Any, Dict, List, Optional
 import psycopg2
 import psycopg2.extras
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-from playwright._impl._api_types import Error as PWError
+# ✅ Imports públicos (sem módulos _impl internos)
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Error as PWError
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 BASE_URL = "https://www.cirurgiaplastica.org.br/encontre-um-cirurgiao/#busca-cirurgiao"

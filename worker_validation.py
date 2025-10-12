@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Worker que consome validations_jobs com validação SBCP.
-Regras novas:
-- Lê do membersnextlevel (metadata) um "documento" que pode ser RQE/CRM/CREFITO.
-- Se o documento estiver vazio -> NÃO consulta -> pendencia direta.
-- Se houver documento -> consulta -> aprova apenas se algum ID retornado (rqe/crm/crefito)
-  casar com o documento informado (considerando UF opcional tipo 98675-MG).
+Worker de validação que consome validations_jobs e valida no site da SBCP.
+Regras:
+- Lê do membersnextlevel.metadata um "documento" (rqe/crm/crefito ou doc).
+- Se o documento estiver vazio -> NÃO consulta -> pendente direta.
+- Se houver documento -> consulta -> aprova somente se algum ID retornado
+  (rqe/crm/crefito, com equivalência com/sem UF) casar com o documento informado.
+- Grava logs mais conclusivos em validations_log.
 """
 
-import json
 import os
 import re
 import time
@@ -17,16 +17,15 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import psycopg2
 import psycopg2.extras
 
-from consulta_medicos import buscar_sbcp, log_validation, set_member_validation  # mantém o fluxo atual
-# buscar_sbcp já busca pelo nome; set_member_validation grava validacao_acesso/portal_validado. :contentReference[oaicite:2]{index=2} :contentReference[oaicite:3]{index=3}
+from consulta_medicos import buscar_sbcp, log_validation, set_member_validation
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "3"))
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
 
-# -----------------------
-# DB helpers
-# -----------------------
+# =========================
+# Conexão / helpers de BD
+# =========================
 def db() -> psycopg2.extensions.connection:
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL não configurada")
@@ -55,8 +54,7 @@ def mark_running(conn, job_id: int, attempts: int) -> None:
         cur.execute(
             """
             UPDATE validations_jobs
-               SET status = 'RUNNING',
-                   attempts = %s
+               SET status = 'RUNNING', attempts = %s
              WHERE id = %s
             """,
             (attempts + 1, job_id),
@@ -67,18 +65,15 @@ def finalize_job(conn, job_id: int, status: str, last_error: Optional[str]) -> N
         cur.execute(
             """
             UPDATE validations_jobs
-               SET status = %s,
-                   last_error = %s
+               SET status = %s, last_error = %s
              WHERE id = %s
             """,
             (status, last_error, job_id),
         )
 
-# -----------------------
+# =========================
 # Normalização & matching
-# -----------------------
-UF_RE = r"(?:-[A-Z]{2}|/[A-Z]{2})$"  # sufixo tipo -MG /MG
-
+# =========================
 def only_digits(s: Optional[str]) -> str:
     return re.sub(r"\D", "", s or "")
 
@@ -107,10 +102,10 @@ def pick_member_document(conn, member_id: int) -> str:
         cur.execute(
             """
             SELECT
-                COALESCE(metadata->>'rqe','')    AS rqe,
-                COALESCE(metadata->>'crm','')    AS crm,
-                COALESCE(metadata->>'crefito','')AS crefito,
-                COALESCE(metadata->>'doc','')    AS doc
+                COALESCE(metadata->>'rqe','')     AS rqe,
+                COALESCE(metadata->>'crm','')     AS crm,
+                COALESCE(metadata->>'crefito','') AS crefito,
+                COALESCE(metadata->>'doc','')     AS doc
             FROM membersnextlevel
             WHERE id = %s
             """,
@@ -128,18 +123,14 @@ def collect_identifiers_from_result(result: Dict[str, Any]) -> Set[str]:
     Extrai possíveis IDs (rqe/crm/crefito) do retorno do scraper.
     Cria um conjunto com variações equivalentes:
       - apenas dígitos
-      - dígitos+UF quando houver
+      - dígitos+UF quando houver (padroniza com '-')
     """
     ids: Set[str] = set()
-
     resultados = result.get("resultados") or []
     if not isinstance(resultados, list) or not resultados:
         return ids
 
-    # olhamos somente o primeiro perfil (como o fluxo atual já faz)
     d = resultados[0] or {}
-
-    # candidatos de chaves (case-insensitive)
     keys = [k for k in d.keys() if isinstance(k, str)]
 
     def add_variants(v: Optional[str]):
@@ -148,9 +139,9 @@ def collect_identifiers_from_result(result: Dict[str, Any]) -> Set[str]:
         num, uf = split_number_uf(str(v))
         if not num:
             return
-        ids.add(num)                  # sem UF
+        ids.add(num)               # sem UF
         if uf:
-            ids.add(f"{num}-{uf}")    # com UF padronizado com '-'
+            ids.add(f"{num}-{uf}") # com UF padronizado
 
     # heurística: qualquer chave que contenha rqe/crm/crefito
     for k in keys:
@@ -158,7 +149,7 @@ def collect_identifiers_from_result(result: Dict[str, Any]) -> Set[str]:
         if "rqe" in lk or "crm" in lk or "crefito" in lk:
             add_variants(str(d.get(k)))
 
-    # fallback: alguns scrapers consolidam *_padrao
+    # campos *_padrao (se existirem)
     for k in ("rqe_padrao", "crm_padrao", "crefito_padrao"):
         if k in d:
             add_variants(str(d.get(k)))
@@ -167,45 +158,35 @@ def collect_identifiers_from_result(result: Dict[str, Any]) -> Set[str]:
 
 def match_document(expected: str, extracted_ids: Set[str]) -> bool:
     """
-    Regra de equivalência:
+    Regras de equivalência:
       - expected '98675' casa com '98675' e com '98675-MG'
       - expected '98675-MG' casa com '98675' e '98675-MG'
     """
     if not expected:
         return False
-
     num, uf = split_number_uf(expected)
-
-    # candidato(s) equivalentes
     candidates = {num}
     if uf:
         candidates.add(f"{num}-{uf.upper()}")
 
-    # match se qualquer candidato estiver no conjunto extraído
-    # ou se o conjunto extraído contiver apenas o número (sem UF)
     for cand in candidates:
         if cand in extracted_ids:
             return True
-
-    # tolerância extra: se extraído tiver apenas dígitos e expected tiver UF, ou vice-versa
     if num in extracted_ids:
         return True
-
     return False
 
-# -----------------------
-# Main loop
-# -----------------------
+# =========================
+# Loop principal
+# =========================
 def work_loop():
-    print(f"🧵 Worker de validação iniciado.\nConfig: POLL_SECONDS={POLL_SECONDS} MAX_ATTEMPTS={MAX_ATTEMPTS}")
+    print(f"🧵 Worker de validação iniciado. POLL_SECONDS={POLL_SECONDS} MAX_ATTEMPTS={MAX_ATTEMPTS}")
     conn = db()
 
     while True:
         try:
-            # Tenta pegar 1 job
             with conn:
                 job = fetch_next_job(conn)
-
                 if not job:
                     time.sleep(POLL_SECONDS)
                     continue
@@ -214,7 +195,8 @@ def work_loop():
                 member_id = job["member_id"]
                 email = job.get("email") or ""
                 nome = job.get("nome") or ""
-                fonte = job.get("fonte") or "sbcp"   # mantém default do pipeline atual :contentReference[oaicite:4]{index=4}
+                # Default da fonte; ajuste para "cirurgiaplastica.org.br" se quiser etiquetar assim
+                fonte = job.get("fonte") or "sbcp"
                 attempts = int(job.get("attempts") or 0)
 
                 if attempts >= MAX_ATTEMPTS:
@@ -224,7 +206,6 @@ def work_loop():
                 print(f"⚙️  Job {job_id} -> RUNNING (attempt {attempts + 1}) [member_id={member_id} fonte={fonte}]")
                 mark_running(conn, job_id, attempts)
 
-            # Executa fora do bloco de transação longa
             steps: List[str] = []
             result: Dict[str, Any] = {}
             last_error: Optional[str] = None
@@ -237,39 +218,53 @@ def work_loop():
                 steps.append(f"expected_doc_read_error:{e_doc}")
 
             if not expected_doc:
-                # Sem documento no BD -> regra: pendencia direta (sem consultar)
-                result = {"ok": False, "steps": steps + ["sem_documento_no_bd"], "resultados": [], "qtd": 0}
-                status_log = "error"
+                # Sem documento no BD -> pendente direto
+                result = {
+                    "ok": False,
+                    "steps": steps + ["sem_documento_no_bd"],
+                    "resultados": [],
+                    "qtd": 0,
+                    "expected_doc": "",
+                    "reason": "pendente_sem_documento",
+                }
+                status_log = "pendente_sem_documento"
+
             else:
-                # 2) Chama a fonte solicitada
+                # 2) Chama a fonte
                 try:
                     if fonte == "sbcp":
-                        result = buscar_sbcp(member_id, nome, email, steps)  # usa apenas o NOME internamente :contentReference[oaicite:5]{index=5}
+                        result = buscar_sbcp(member_id, nome, email, steps)
                     else:
                         steps.append(f"fonte_desconhecida:{fonte}")
-                        result = {"ok": False, "steps": steps, "resultados": [], "qtd": 0}
+                        result = {"ok": False, "steps": steps, "resultados": [], "qtd": 0, "reason": "fonte_desconhecida"}
+
+                    # 3) Coleta IDs extraídos e faz matching
+                    extracted_ids = collect_identifiers_from_result(result)
+                    if extracted_ids:
+                        steps.append(f"ids_extraidos={sorted(list(extracted_ids))[:8]}")
+                    else:
+                        steps.append("ids_extraidos=vazio")
+
+                    is_match = match_document(expected_doc, extracted_ids)
+                    result["expected_doc"] = expected_doc
+                    result["match"] = bool(is_match)
+
+                    if result.get("reason") == "sem_resultados_ou_layout_alterado":
+                        status_log = "sem_resultados"
+                        result["ok"] = False
+                    elif is_match:
+                        status_log = "ok"
+                        result["ok"] = True
+                    else:
+                        status_log = "numero_registro_invalido"
+                        result["ok"] = False
+
                 except Exception as e:
                     last_error = f"exception:{e}"
                     result = {"ok": False, "steps": steps + [last_error], "resultados": [], "qtd": 0}
+                    status_log = "error_execucao"
 
-                # 3) Compara IDs: aprova só se houver match
-                extracted_ids = collect_identifiers_from_result(result)
-                if extracted_ids:
-                    steps.append(f"ids_extraidos={sorted(list(extracted_ids))[:6]}")
-                else:
-                    steps.append("ids_extraidos=vazio")
-
-                is_match = match_document(expected_doc, extracted_ids)
-                if is_match:
-                    result["ok"] = True
-                    status_log = "ok"
-                    steps.append(f"match_ok expected='{expected_doc}'")
-                else:
-                    result["ok"] = False
-                    status_log = "error"
-                    steps.append(f"match_fail expected='{expected_doc}'")
-
-            # 4) Log + atualização de status do membro
+            # 4) Log + atualização do membro
             try:
                 log_validation(conn, member_id, fonte, status_log, {"raw": result, "fonte": fonte})
                 if result.get("ok"):
@@ -279,7 +274,7 @@ def work_loop():
             except Exception as e:
                 last_error = f"db_erro:{e}"
 
-            # 5) Finaliza o job
+            # 5) Finaliza job
             with conn:
                 if result.get("ok"):
                     finalize_job(conn, job_id, "SUCCEEDED", None)
@@ -287,13 +282,12 @@ def work_loop():
                 else:
                     if attempts + 1 < MAX_ATTEMPTS:
                         finalize_job(conn, job_id, "PENDING", last_error or "retry")
-                        print(f"🔁 Job {job_id} re-enfileirado (retry).")
+                        print(f"🔁 Job {job_id} re-enfileirado (retry). status_log={status_log}")
                     else:
-                        finalize_job(conn, job_id, "FAILED", last_error or "erro_definitivo")
-                        print(f"🧯 Job {job_id} -> FAILED definitivo.")
+                        finalize_job(conn, job_id, "FAILED", last_error or status_log or "erro_definitivo")
+                        print(f"🧯 Job {job_id} -> FAILED definitivo. status_log={status_log}")
 
         except Exception as outer:
-            # Erro geral do loop
             print(f"💥 Loop erro: {outer}")
             time.sleep(POLL_SECONDS)
 

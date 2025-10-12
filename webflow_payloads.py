@@ -1,14 +1,20 @@
-# worker_validation.py
 import os
-import time
 import json
+from datetime import datetime
+from typing import Tuple, Optional
+
 import psycopg2
 import psycopg2.extras
-from contextlib import contextmanager
+from flask import Flask, request, jsonify
 
-# =========================
+# -----------------------------------------------------------------------------
+# Flask app (precisa existir como variável de módulo para o Gunicorn encontrá-la)
+# -----------------------------------------------------------------------------
+app = Flask(__name__)
+
+# -----------------------------------------------------------------------------
 # Config
-# =========================
+# -----------------------------------------------------------------------------
 def _env(name, default=None):
     v = os.environ.get(name)
     return v if v not in (None, "") else default
@@ -18,264 +24,198 @@ DATABASE_URL = (
     or f"postgresql://{_env('PGUSER','neon')}:{_env('PGPASSWORD','password')}@{_env('PGHOST','localhost')}:{_env('PGPORT','5432')}/{_env('PGDATABASE','neondb')}"
 )
 
-POLL_INTERVAL_SECONDS = int(_env("POLL_INTERVAL_SECONDS", "5"))
-BATCH_SIZE = int(_env("BATCH_SIZE", "5"))
+AUDIT_TABLE = _env("AUDIT_TABLE", "public.webhook_members_audit")
+MEMBERS_TABLE = _env("MEMBERS_TABLE", "public.membersnextlevel")
+JOBS_TABLE    = _env("JOBS_TABLE", "public.validations_jobs")  # nome com S
 
-# =========================
+# -----------------------------------------------------------------------------
 # DB helpers
-# =========================
-@contextmanager
-def db() -> psycopg2.extensions.connection:
+# -----------------------------------------------------------------------------
+def db():
+    # autocommit False para controlar transações
     conn = psycopg2.connect(DATABASE_URL)
+    return conn
+
+def jdump(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+def log(*args, **kwargs):
+    msg = " ".join(str(a) for a in args)
+    if kwargs:
+        msg += " " + " ".join(f"{k}={v}" for k, v in kwargs.items())
+    print(msg, flush=True)
+
+# -----------------------------------------------------------------------------
+# Parse helpers para o payload do Webflow
+# -----------------------------------------------------------------------------
+def parse_webflow_payload(body: dict) -> Tuple[str, str, str, str, dict]:
+    """
+    Retorna: (payload_id, nome, email, rqe, body_dict)
+    Lê de:
+      body['payload']['id']
+      body['payload']['data']['nome'], ['email'], ['Rqe']
+    """
+    p = body.get("payload") or {}
+    pid = str(p.get("id") or "").strip()
+
+    data = p.get("data") or {}
+    nome  = str(data.get("nome") or "").strip()
+    email = str(data.get("email") or "").strip()
+    rqe   = str(data.get("Rqe") or "").strip()
+
+    return pid, nome, email, rqe, body
+
+# -----------------------------------------------------------------------------
+# SQL actions
+# -----------------------------------------------------------------------------
+def insert_audit(conn, payload_id: str, fonte: str, status: str, payload: dict):
+    q = f"""
+        INSERT INTO {AUDIT_TABLE} (payload_id, fonte, status, payload, created_at)
+        VALUES (%s, %s, %s, %s, NOW())
+        ON CONFLICT (payload_id) DO NOTHING
+    """
+    with conn.cursor() as cur:
+        cur.execute(q, (payload_id, fonte, status, json.dumps(payload, ensure_ascii=False)))
+    log("🗄️  Persistência DB (audit)", status=status, payload_id=payload_id)
+
+def upsert_member(conn, nome: str, email: str, rqe: str, raw_payload: dict, celular: Optional[str]) -> int:
+    """
+    UPSERT no membersnextlevel, preenchendo:
+      - nome, email
+      - raw (merge jsonb)
+      - metadata (merge jsonb) com celular e rqe
+      - validacao_acesso = 'pending'
+      - portal_validado  = 'sbcp' (primeiro portal que vamos tentar)
+    Retorna member_id (id).
+    """
+    # Monta jsons
+    raw_json = {"source": "webflow", "received_at": datetime.utcnow().isoformat() + "Z"}
+    # Merge do payload bruto (limitado) dentro de raw_json
+    raw_json["payload_hint"] = {
+        "has_data": bool(raw_payload.get("payload")),
+        "form": (raw_payload.get("payload") or {}).get("name"),
+    }
+
+    # Metadata que sempre acumulamos
+    metadata = {}
+    if celular:
+        metadata["celular"] = celular
+    if rqe:
+        metadata["rqe"] = rqe
+
+    q = f"""
+        INSERT INTO {MEMBERS_TABLE}
+          (nome, email, raw, metadata, validacao_acesso, portal_validado, created_at)
+        VALUES
+          (%s,   %s,    COALESCE(%s::jsonb,'{{}}'::jsonb),
+                 COALESCE(%s::jsonb,'{{}}'::jsonb),
+                 'pending', 'sbcp', NOW())
+        ON CONFLICT (email) DO UPDATE
+          SET nome = EXCLUDED.nome,
+              raw  = COALESCE({MEMBERS_TABLE}.raw, '{{}}'::jsonb) || EXCLUDED.raw,
+              metadata = COALESCE({MEMBERS_TABLE}.metadata, '{{}}'::jsonb) || EXCLUDED.metadata,
+              validacao_acesso = 'pending',
+              portal_validado  = 'sbcp'
+        RETURNING id
+    """
+    with conn.cursor() as cur:
+        cur.execute(q, (
+            nome,
+            email,
+            jdump(raw_json),
+            jdump(metadata)
+        ))
+        mid = cur.fetchone()[0]
+    log("👤 UPSERT member", email=email, id=mid)
+    return mid
+
+def enqueue_job(conn, member_id: int, nome: str, email: str):
+    """
+    Enfileira em validations_jobs (status PENDING).
+    Requer UNIQUE(member_id, fonte) para DO NOTHING funcionar.
+    """
+    q = f"""
+        INSERT INTO {JOBS_TABLE} (member_id, email, nome, fonte, status, attempts, created_at)
+        VALUES (%s, %s, %s, 'sbcp', 'PENDING', 0, NOW())
+        ON CONFLICT (member_id, fonte) DO NOTHING
+    """
+    with conn.cursor() as cur:
+        cur.execute(q, (member_id, email, nome))
+    log("📥 Job enfileirado", member_id=member_id, email=email, fonte='sbcp', status='PENDING')
+
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return jsonify({"ok": True, "ts": datetime.utcnow().isoformat() + "Z"})
+
+@app.route("/webflow-webhook", methods=["POST"])
+def webflow_webhook():
+    source = "webflow"
+    dry_run = request.args.get("dry_run") in ("1", "true", "yes")
+
     try:
-        yield conn
-        conn.close()
+        body = request.get_json(force=True, silent=False) or {}
     except Exception:
+        return jsonify({"ok": False, "error": "invalid-json"}), 400
+
+    payload_id, nome, email, rqe, full = parse_webflow_payload(body)
+    celular = (((full.get("payload") or {}).get("data") or {}).get("celular") or "").strip()
+
+    log("📨 WEBFLOW",
+        payload_id=payload_id or "(none)",
+        form=(full.get("payload") or {}).get("name"),
+        nome=nome, email=email, rqe=rqe)
+
+    # Validação mínima de campos
+    if not email or not nome:
+        return jsonify({"ok": False, "error": "missing nome/email"}), 400
+
+    conn = db()
+    try:
+        conn.autocommit = False
+
+        # 1) AUDITORIA (sempre registramos)
+        try:
+            insert_audit(conn, payload_id or f"anon-{datetime.utcnow().timestamp()}", source, "received", full)
+        except Exception as e_audit:
+            # não bloqueia o fluxo principal
+            log("⚠️ audit-fail", err=str(e_audit))
+
+        # 2) UPSERT do membro na principal
+        member_id = upsert_member(conn, nome=nome, email=email, rqe=rqe, raw_payload=full, celular=celular)
+
+        # 3) Enfileira job (a menos que seja dry_run)
+        if not dry_run:
+            try:
+                enqueue_job(conn, member_id=member_id, nome=nome, email=email)
+            except Exception as e_job:
+                # logamos erro na auditoria secundária (validations_log) ou apenas no console
+                log("⚠️ enqueue-fail", err=str(e_job))
+                # não damos rollback por isso — mantemos o membro salvo
+        else:
+            log("🧪 dry_run=1 → não criei job")
+
+        conn.commit()
+        return jsonify({
+            "ok": True,
+            "member_id": member_id,
+            "queued": (not dry_run),
+            "payload_id": payload_id
+        })
+    except Exception as e:
+        conn.rollback()
+        log("💥 ERRO HANDLER", err=repr(e))
+        return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
         try:
             conn.close()
         except:
             pass
-        raise
 
-def log(*args, **kwargs):
-    msg = " ".join([str(a) for a in args])
-    if kwargs:
-        msg += " " + " ".join([f"{k}={v}" for k, v in kwargs.items()])
-    print(msg, flush=True)
-
-def digits_only(s: str) -> str:
-    return "".join(ch for ch in (s or "") if ch.isdigit())
-
-# =========================
-# Validadores (sites)
-# =========================
-def buscar_sbcp(nome: str):
-    """
-    Valida RQE no site da SBCP (cirurgiaplastica.org.br).
-    Retorno padronizado:
-      {
-        "ok": True|False,            # se achou um perfil compatível com o nome
-        "numero": "12345" or "",     # número extraído (RQE/CRM/CREFITO) se encontrado
-        "site": "cirurgiaplastica.org.br",
-        "steps": [ ... strings de log ... ]
-      }
-    """
-    steps = []
-    site = "cirurgiaplastica.org.br"
-
-    # >>>>>>>>>>>> TROQUE ESTE BLOCO PELO SEU CRAWLER REAL <<<<<<<<<<<<
-    # Mock simples: se o nome tiver "Teste", retorna mismatch; se "GUSTAVO AQUINO", retorna 1364 por exemplo.
-    nm = (nome or "").strip().upper()
-    numero = ""
-    ok = False
-    if nm:
-        # simular que achou perfil
-        ok = True
-        # simulador: número "buscado"
-        if "GUILHERME" in nm or "GUSTAVO" in nm:
-            numero = "1364"
-        else:
-            numero = "99999"
-    steps.append(f"mock: nome='{nome}' ok={ok} numero='{numero}'")
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
-    return {"ok": ok, "numero": numero, "site": site, "steps": steps}
-
-# Adicione aqui os próximos validadores na ordem desejada
-VALIDATORS_IN_ORDER = [
-    buscar_sbcp,
-    # ex.: buscar_cfm, buscar_cremesp, ...
-]
-
-# =========================
-# Core
-# =========================
-def fetch_pending_jobs(conn, limit=BATCH_SIZE):
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("""
-        SELECT id, member_id, email, nome, fonte, status, attempts, created_at
-        FROM public.validations_jobs
-        WHERE status = 'PENDING'
-        ORDER BY created_at ASC
-        LIMIT %s
-    """, (limit,))
-    rows = cur.fetchall()
-    cur.close()
-    return rows
-
-def mark_running(conn, job_id):
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE public.validations_jobs
-        SET status = 'RUNNING'
-        WHERE id = %s AND status = 'PENDING'
-    """, (job_id,))
-    updated = cur.rowcount
-    cur.close()
-    return updated == 1
-
-def read_member_and_number(conn, member_id):
-    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute("""
-        SELECT id, nome, email,
-               COALESCE(metadata, '{}'::jsonb) as metadata
-        FROM public.membersnextlevel
-        WHERE id = %s
-    """, (member_id,))
-    row = cur.fetchone()
-    cur.close()
-    if not row:
-        return None, None
-
-    meta = row["metadata"] or {}
-    # aceite RQE/CRM/CREFITO; normalizamos tudo para dígitos
-    numero = (
-        meta.get("rqe") or meta.get("RQE") or
-        meta.get("crm") or meta.get("CRM") or
-        meta.get("crefito") or meta.get("CREFITO") or ""
-    )
-    return row, digits_only(numero)
-
-def finish_success(conn, job_id, member_id, site_name, attempts_inc=1):
-    # job
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE public.validations_jobs
-        SET status = 'SUCCEEDED',
-            attempts = attempts + %s,
-            fonte = %s
-        WHERE id = %s
-    """, (attempts_inc, site_name, job_id))
-    # member
-    cur.execute("""
-        UPDATE public.membersnextlevel
-        SET validacao_acesso = 'granted',
-            portal_validado  = %s
-        WHERE id = %s
-    """, (site_name, member_id))
-    cur.close()
-
-def finish_failure(conn, job_id, member_id, attempts_inc=1):
-    # job
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE public.validations_jobs
-        SET status = 'FAILED',
-            attempts = attempts + %s,
-            fonte = ''
-        WHERE id = %s
-    """, (attempts_inc, job_id))
-    # member em pending e sem portal_validado
-    cur.execute("""
-        UPDATE public.membersnextlevel
-        SET validacao_acesso = 'pending',
-            portal_validado  = NULL
-        WHERE id = %s
-    """, (member_id,))
-    cur.close()
-
-def log_attempt(conn, member_id, fonte, status, payload_dict):
-    # opcional: guarda auditoria de tentativas
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO public.validations_log (member_id, fonte, status, payload, created_at)
-            VALUES (%s, %s, %s, %s, NOW())
-        """, (member_id, fonte, status, json.dumps(payload_dict, ensure_ascii=False)))
-        cur.close()
-    except Exception as e:
-        log("warn:failed to log validations_log", err=str(e))
-
-def process_job(conn, job):
-    job_id = job["id"]
-    member_id = job["member_id"]
-    nome = job["nome"]
-    email = job["email"]
-
-    member, numero_cadastro = read_member_and_number(conn, member_id)
-    if not member:
-        log("job-skipped: member not found", job_id=job_id, member_id=member_id)
-        # marca como failed para não travar fila
-        finish_failure(conn, job_id, member_id, attempts_inc=1)
-        return
-
-    log("RUN job", job_id=job_id, member_id=member_id, nome=nome, email=email, numero=numero_cadastro)
-
-    # Caso não tenha número no cadastro, não há como confirmar → failure (ou deixe PENDING para tratar manualmente)
-    if not numero_cadastro:
-        log_attempt(conn, member_id, "", "no-number", {"reason": "member.metadata without rqe/crm/crefito"})
-        finish_failure(conn, job_id, member_id, attempts_inc=1)
-        return
-
-    # tenta cada site em ordem até o primeiro que CONFIRMAR MESMO NÚMERO
-    for validator in VALIDATORS_IN_ORDER:
-        site_result = {}
-        try:
-            site_result = validator(nome or "")
-        except Exception as e:
-            log_attempt(conn, member_id, "", "validator-error", {"site": validator.__name__, "error": str(e)})
-            continue
-
-        site_name = site_result.get("site") or ""
-        numero_site = digits_only(site_result.get("numero") or "")
-        ok_lookup = bool(site_result.get("ok"))
-
-        log("site-try", site=site_name, ok_lookup=ok_lookup, numero_site=numero_site)
-
-        # se achou perfil e tem número, comparamos
-        if ok_lookup and numero_site:
-            if numero_site == numero_cadastro:
-                # VALIDADO!
-                log_attempt(conn, member_id, site_name, "matched", site_result)
-                finish_success(conn, job_id, member_id, site_name, attempts_inc=1)
-                return
-            else:
-                # achou, mas número difere → continua tentando outro site
-                log_attempt(conn, member_id, site_name, "mismatch", {"site": site_name, "expected": numero_cadastro, "found": numero_site, "steps": site_result.get("steps")})
-                continue
-        else:
-            # não achou/sem número → continua tentando
-            log_attempt(conn, member_id, site_name, "not-found", site_result)
-            continue
-
-    # terminou todos os sites sem confirmar
-    finish_failure(conn, job_id, member_id, attempts_inc=1)
-
-def main_loop():
-    log("worker-started")
-    while True:
-        try:
-            with db() as conn:
-                conn.autocommit = False
-
-                jobs = fetch_pending_jobs(conn, limit=BATCH_SIZE)
-                if not jobs:
-                    conn.commit()
-                    time.sleep(POLL_INTERVAL_SECONDS)
-                    continue
-
-                for job in jobs:
-                    try:
-                        if not mark_running(conn, job["id"]):
-                            # outro worker pegou
-                            conn.commit()
-                            continue
-
-                        process_job(conn, job)
-                        conn.commit()
-                    except Exception as e:
-                        conn.rollback()
-                        log("job-error", job_id=job["id"], err=str(e))
-                        # marca como FAILED para não travar
-                        try:
-                            with conn:
-                                finish_failure(conn, job["id"], job["member_id"], attempts_inc=1)
-                                conn.commit()
-                        except Exception as e2:
-                            log("job-error-fallback", err=str(e2))
-        except Exception as e:
-            log("loop-error", err=str(e))
-            time.sleep(POLL_INTERVAL_SECONDS)
-
+# -----------------------------------------------------------------------------
+# Dev server local (não usado no Render com gunicorn)
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    main_loop()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))

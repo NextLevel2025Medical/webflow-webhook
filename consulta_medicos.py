@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 Scraper da SBCP (cirurgiaplastica.org.br) usando Playwright (API síncrona).
-Inclui rotinas utilitárias:
-- buscar_sbcp(member_id, nome, email, steps): executa a busca pelo nome.
+
+Principais funções públicas:
+- buscar_sbcp(member_id, nome, email, steps): executa a busca pelo nome e tenta abrir o 1º perfil.
 - log_validation(conn, member_id, fonte, status, payload): insere em validations_log.
 - set_member_validation(conn, member_id, status, fonte): atualiza membersnextlevel.
-O scraper está mais tolerante (múltiplos seletores, timeouts maiores) e registra
-'reason' claro quando não encontra resultados ou o layout mudou.
+
+Melhorias:
+- Busca tolerante (múltiplos seletores; timeouts maiores).
+- Diagnósticos claros em caso de falha (reason: falha_input, falha_submit,
+  sem_resultados_ou_layout_alterado, falha_abrir_perfil, playwright_browser_missing).
+- Extração de crm/rqe/crefito com normalização "*_padrao" (ex.: "98675-MG" ou "98675").
+- Fallback de instalação automática do Chromium (opcional).
 """
 
 import os
@@ -17,9 +23,9 @@ import psycopg2
 import psycopg2.extras
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright._impl._api_types import Error as PWError
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 BASE_URL = "https://www.cirurgiaplastica.org.br/encontre-um-cirurgiao/#busca-cirurgiao"
 
 # =========================
@@ -59,6 +65,27 @@ def set_member_validation(conn, member_id: int, status: str, fonte: str) -> None
             """,
             (status, fonte, member_id),
         )
+
+# =========================
+# Playwright: auto-heal (opcional)
+# =========================
+def _ensure_playwright_browsers(steps: List[str]) -> bool:
+    """Tenta instalar o Chromium e deps caso o executável não exista."""
+    import subprocess, sys
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        steps.append("playwright_install_ok")
+        if r.stdout:
+            steps.append(f"playwright_install_stdout={r.stdout.decode(errors='ignore')[:300]}")
+        if r.stderr:
+            steps.append(f"playwright_install_stderr={r.stderr.decode(errors='ignore')[:300]}")
+        return True
+    except Exception as e:
+        steps.append(f"playwright_install_fail:{e}")
+        return False
 
 # =========================
 # Helpers de Playwright
@@ -111,7 +138,6 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
     """
     dados: Dict[str, Any] = {}
 
-    # Exemplo de mapeamento; ajuste se necessário
     campos = [
         ("nome", "h1, h2, .perfil-nome, .titulo-perfil"),
         ("crm", "text=CRM"),
@@ -159,7 +185,7 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
 def buscar_sbcp(member_id: int, nome_busca: str, email: str, steps: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Busca por nome no portal da SBCP (cirurgiaplastica.org.br) e tenta abrir o primeiro perfil.
-    Retorna:
+    Retorno padrão:
       {
         ok: bool,
         qtd: int,
@@ -176,7 +202,25 @@ def buscar_sbcp(member_id: int, nome_busca: str, email: str, steps: Optional[Lis
     steps.append(f"wrapper: usando apenas nome='{nome_busca}' (args extras ignorados)")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        # --- launch com retry/auto-heal ---
+        try:
+            browser = p.chromium.launch(headless=True)
+        except PWError as e:
+            steps.append(f"chromium_launch_fail:{e}")
+            if _ensure_playwright_browsers(steps):
+                # tenta relançar uma vez
+                browser = p.chromium.launch(headless=True)
+            else:
+                return {
+                    "ok": False,
+                    "qtd": 0,
+                    "resultados": [],
+                    "steps": steps,
+                    "nome_busca": nome_busca,
+                    "timing_ms": int((time.time() - start) * 1000),
+                    "reason": "playwright_browser_missing",
+                }
+
         context = browser.new_context()
         page = context.new_page()
 
@@ -252,7 +296,7 @@ def buscar_sbcp(member_id: int, nome_busca: str, email: str, steps: Optional[Lis
                     continue
 
             if not apareceu:
-                # tenta identificar texto "sem resultados" e capturar snippet de HTML
+                # tenta identificar "sem resultados" e capturar snippet do HTML
                 try:
                     msg_empty = page.get_by_text("Nenhum resultado", exact=False)
                     msg_empty.wait_for(timeout=2000, state="visible")

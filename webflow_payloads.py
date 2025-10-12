@@ -109,7 +109,7 @@ def webflow_webhook():
 
             # 3) Enfileira job PENDING (idempotente por member_id)
             conn.execute(text("""
-                INSERT INTO validation_jobs (member_id, email, nome, fonte, status, attempts, created_at)
+                INSERT INTO validations_jobs (member_id, email, nome, fonte, status, attempts, created_at)
                 VALUES (:mid, :email, :nome, 'sbcp', 'PENDING', 0, NOW())
                 ON CONFLICT (member_id) DO NOTHING
             """), {"mid": member_id, "email": email, "nome": nome})
@@ -131,3 +131,4 @@ def webflow_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")), debug=True)
+

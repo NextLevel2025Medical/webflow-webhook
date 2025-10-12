@@ -85,7 +85,7 @@ def upsert_member(conn, nome: str, email: str, rqe: str, raw_payload: dict, celu
       - raw (merge jsonb)
       - metadata (merge jsonb) com celular e rqe
       - validacao_acesso = 'pending'
-      - portal_validado  = 'sbcp' (primeiro portal que vamos tentar)
+      - portal_validado  = 'cirurgiaplastica.org.br' (primeiro portal que vamos tentar)
     Retorna member_id (id).
     """
     # Monta jsons
@@ -109,13 +109,13 @@ def upsert_member(conn, nome: str, email: str, rqe: str, raw_payload: dict, celu
         VALUES
           (%s,   %s,    COALESCE(%s::jsonb,'{{}}'::jsonb),
                  COALESCE(%s::jsonb,'{{}}'::jsonb),
-                 'pending', 'sbcp', NOW())
+                 'pending', 'cirurgiaplastica.org.br', NOW())
         ON CONFLICT (email) DO UPDATE
           SET nome = EXCLUDED.nome,
               raw  = COALESCE({MEMBERS_TABLE}.raw, '{{}}'::jsonb) || EXCLUDED.raw,
               metadata = COALESCE({MEMBERS_TABLE}.metadata, '{{}}'::jsonb) || EXCLUDED.metadata,
               validacao_acesso = 'pending',
-              portal_validado  = 'sbcp'
+              portal_validado  = 'cirurgiaplastica.org.br'
         RETURNING id
     """
     with conn.cursor() as cur:
@@ -136,12 +136,12 @@ def enqueue_job(conn, member_id: int, nome: str, email: str):
     """
     q = f"""
         INSERT INTO {JOBS_TABLE} (member_id, email, nome, fonte, status, attempts, created_at)
-        VALUES (%s, %s, %s, 'sbcp', 'PENDING', 0, NOW())
+        VALUES (%s, %s, %s, 'cirurgiaplastica.org.br', 'PENDING', 0, NOW())
         ON CONFLICT (member_id, fonte) DO NOTHING
     """
     with conn.cursor() as cur:
         cur.execute(q, (member_id, email, nome))
-    log("📥 Job enfileirado", member_id=member_id, email=email, fonte='sbcp', status='PENDING')
+    log("📥 Job enfileirado", member_id=member_id, email=email, fonte='cirurgiaplastica.org.br', status='PENDING')
 
 # -----------------------------------------------------------------------------
 # Routes
@@ -219,3 +219,4 @@ def webflow_webhook():
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+

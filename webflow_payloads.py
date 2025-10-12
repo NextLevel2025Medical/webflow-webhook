@@ -1,134 +1,283 @@
 # webflow_payloads.py
-# Endpoint Flask para receber SOMENTE o webhook do Webflow (Form Submission)
-
-import os
 import json
-import datetime as dt
-from flask import Flask, request, jsonify
-from sqlalchemy import create_engine, text
+import os
+import sys
+import traceback
+from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
+
+import psycopg2
+import psycopg2.extras
+from flask import Flask, jsonify, request
+
+# ------------------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    print("❌ DATABASE_URL não definido no ambiente.", file=sys.stderr)
+    sys.exit(1)
+
+SCHEMA = "public"
+TBL_AUDIT = f"{SCHEMA}.webhook_members_audit"
+TBL_MEMBERS = f"{SCHEMA}.membersnextlevel"
+TBL_JOBS = f"{SCHEMA}.validations_jobs"
+
+FONTE = "webflow"          # origem do webhook
+PORTAL_VALIDADO = "sbcp"   # portal alvo da validação
 
 app = Flask(__name__)
 
-# --- Config DB ---
-DATABASE_URL = os.environ.get("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL não configurado")
+# ------------------------------------------------------------------------------
+# Helpers DB
+# ------------------------------------------------------------------------------
+def get_conn():
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = False
+    return conn
 
-if not DATABASE_URL.startswith(("postgresql://", "postgresql+psycopg2://")):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+def dict_or_empty(x) -> Dict[str, Any]:
+    return x if isinstance(x, dict) else {}
 
-ENGINE = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    pool_size=int(os.environ.get("DB_POOL_SIZE", "5")),
-    max_overflow=int(os.environ.get("DB_MAX_OVERFLOW", "5")),
-)
+def jdump(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
-def now_utc_iso() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat()
+def audit_insert(conn, payload_id: str, status: str, payload_obj: Dict[str, Any]) -> None:
+    """
+    Registra na auditoria (idempotente por payload_id se desejar).
+    schema esperado da tabela:
+      (payload_id text PRIMARY KEY, fonte text, status text, payload jsonb, created_at timestamptz default now())
+    """
+    sql = f"""
+        INSERT INTO {TBL_AUDIT} (payload_id, fonte, status, payload, created_at)
+        VALUES (%(pid)s, %(fonte)s, %(status)s, %(payload)s, NOW())
+        ON CONFLICT (payload_id) DO UPDATE
+          SET status = EXCLUDED.status,
+              payload = EXCLUDED.payload
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {
+            "pid": payload_id,
+            "fonte": FONTE,
+            "status": status,
+            "payload": jdump(payload_obj),
+        })
 
-def _norm(v):
-    return (v or "").strip()
+def upsert_member(conn, nome: str, email: str, celular: Optional[str], rqe: Optional[str],
+                  raw_source: Dict[str, Any]) -> int:
+    """
+    UPSERT em membersnextlevel.
+    Campos assumidos na tabela:
+      - id bigserial PK
+      - nome text
+      - email text UNIQUE
+      - raw jsonb NOT NULL
+      - metadata jsonb
+      - validacao_acesso text
+      - portal_validado text
+      - created_at timestamptz
+    """
+    # raw sempre não-nulo
+    raw_json = {
+        "source": FONTE,
+        "payload_meta": {
+            "received_at": datetime.utcnow().isoformat() + "Z"
+        },
+        **dict_or_empty(raw_source),
+    }
+    # metadata incorporando rqe + celular
+    meta = {}
+    if celular:
+        meta["celular"] = celular
+    if rqe:
+        meta["rqe"] = rqe
 
-def _lower_keys(d: dict) -> dict:
-    return {str(k).lower(): v for k, v in (d or {}).items()}
+    sql = f"""
+        INSERT INTO {TBL_MEMBERS}
+            (nome, email, raw, metadata, validacao_acesso, portal_validado, created_at)
+        VALUES
+            (%(nome)s, %(email)s, %(raw)s::jsonb, %(meta)s::jsonb, 'pending', %(portal)s, NOW())
+        ON CONFLICT (email) DO UPDATE
+          SET nome = EXCLUDED.nome,
+              raw  = COALESCE({TBL_MEMBERS}.raw, '{{}}'::jsonb) || EXCLUDED.raw,
+              metadata = COALESCE({TBL_MEMBERS}.metadata, '{{}}'::jsonb) || EXCLUDED.metadata,
+              validacao_acesso = 'pending',
+              portal_validado  = EXCLUDED.portal_validado
+        RETURNING id
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {
+            "nome": nome,
+            "email": email,
+            "raw": jdump(raw_json),
+            "meta": jdump(meta),
+            "portal": PORTAL_VALIDADO,
+        })
+        row = cur.fetchone()
+        return int(row[0])
 
-@app.get("/")
-def root():
-    return jsonify({
-        "ok": True,
-        "service": "webflow-webhook",
-        "time": now_utc_iso()
-    }), 404
+def enqueue_validation_job(conn, member_id: int, nome: str, email: str) -> None:
+    """
+    Cria job idempotente por (member_id, fonte) em public.validations_jobs.
+    Espera índice único: ux_validations_jobs_member_fonte (member_id, fonte)
+    Colunas: (id, member_id, email, nome, fonte, status, attempts, created_at)
+    """
+    sql = f"""
+        INSERT INTO {TBL_JOBS} (member_id, email, nome, fonte, status, attempts, created_at)
+        VALUES (%(mid)s, %(email)s, %(nome)s, %(fonte)s, 'PENDING', 0, NOW())
+        ON CONFLICT (member_id, fonte) DO NOTHING
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {
+            "mid": member_id,
+            "email": email,
+            "nome": nome,
+            "fonte": PORTAL_VALIDADO,   # a fonte do JOB é o portal a validar
+        })
 
-@app.post("/webflow-webhook")
+# ------------------------------------------------------------------------------
+# Parse do payload Webflow
+# ------------------------------------------------------------------------------
+def extract_webflow(payload: Dict[str, Any]) -> Tuple[str, str, str, Optional[str], Optional[str], Dict[str, Any]]:
+    """
+    Retorna (payload_id, nome, email, celular, rqe, raw_source)
+    Espera entrada no formato:
+    {
+      "payload": {
+        "id": "...",
+        "name": "cirurgiao",
+        "data": { "Rqe": "...", "nome": "...", "email": "...", "celular": "...", ... },
+        ...
+      },
+      "triggerType": "form_submission"
+    }
+    """
+    p = dict_or_empty(payload.get("payload"))
+    payload_id = str(p.get("id") or f"wf-{datetime.utcnow().timestamp()}")
+
+    data = dict_or_empty(p.get("data"))
+    # chaves (Rqe | rqe)
+    rqe = data.get("Rqe") or data.get("rqe") or data.get("RQE")
+    if isinstance(rqe, (int, float)):
+        rqe = str(rqe)
+    elif isinstance(rqe, str):
+        rqe = rqe.strip() or None
+    else:
+        rqe = None
+
+    nome = (data.get("nome") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    celular = (data.get("celular") or "").strip() or None
+
+    raw_source = {
+        "webflow_name": p.get("name"),
+        "webflow_siteId": p.get("siteId"),
+        "webflow_pageUrl": p.get("pageUrl"),
+        "webflow_submittedAt": p.get("submittedAt"),
+        "formElementId": p.get("formElementId"),
+    }
+
+    return payload_id, nome, email, celular, rqe, raw_source
+
+# ------------------------------------------------------------------------------
+# Rota
+# ------------------------------------------------------------------------------
+@app.route("/webflow-webhook", methods=["POST"])
 def webflow_webhook():
-    body = request.get_json(silent=True) or {}
-    trigger = body.get("triggerType")
+    client_ip = request.headers.get("x-forwarded-for") or request.remote_addr
+    try:
+        body = request.get_json(force=True, silent=False)
+    except Exception:
+        return jsonify({"ok": False, "error": "corpo inválido (JSON)"}), 400
 
-    # Aceita apenas Webflow Form Submission
-    if trigger != "form_submission":
-        print(f"🚫 NOT_WEBFLOW_FORM: triggerType={trigger!r} ignorado")
-        return jsonify({"ok": True, "skipped": "not_webflow_form"}), 200
+    dry_run = request.args.get("dry_run") in ("1", "true", "yes")
+    payload_id, nome, email, celular, rqe, raw_source = extract_webflow(body or {})
 
-    pf = body.get("payload") or {}
-    data = pf.get("data") or {}
-    payload_id = _norm(pf.get("id"))
-    form_name = _norm(pf.get("name"))
+    print(f"📨 WEBFLOW payload_id={payload_id} form={raw_source.get('webflow_name')} "
+          f"nome={nome} email={email} rqe={rqe}")
 
-    dlow = _lower_keys(data)
-    nome    = _norm(dlow.get("nome") or dlow.get("nome_completo"))
-    email   = _norm(dlow.get("email")).lower()
-    celular = _norm(dlow.get("celular") or dlow.get("whatsapp"))
-    rqe     = _norm(dlow.get("rqe") or dlow.get("rqe_crefito"))
-
-    print(f"📨 WEBFLOW payload_id={payload_id} form={form_name} nome={nome} email={email} rqe={rqe}")
-
-    # Campos mínimos
-    if not nome or not email or not rqe:
-        print("⚠️ MISSING_REQUIRED_FIELDS", {"nome": bool(nome), "email": bool(email), "rqe": bool(rqe)})
-        return jsonify({
-            "ok": True,
-            "skipped": "missing_required_fields",
-            "got": {"nome": bool(nome), "email": bool(email), "rqe": bool(rqe)}
-        }), 200
+    # validações mínimas
+    if not nome or not email:
+        # audita como inválido e encerra
+        try:
+            with get_conn() as conn:
+                audit_insert(conn, payload_id, "invalid", body)
+                conn.commit()
+        except Exception as e:
+            print(f"⚠️ falhou ao auditar inválido: {e}")
+        return jsonify({"ok": False, "error": "nome/email ausentes"}), 200
 
     try:
-        with ENGINE.begin() as conn:
-            # 1) Auditoria + idempotência (payload_id)
-            # OBS: Removido '::jsonb' — Postgres converte pelo tipo da coluna
-            audit_res = conn.execute(text("""
-                INSERT INTO webhook_members_audit (payload_id, fonte, status, payload, created_at)
-                VALUES (:payload_id, 'webflow', 'received', :payload, NOW())
-                ON CONFLICT (payload_id) DO NOTHING
-            """), {"payload_id": payload_id, "payload": json.dumps(body)})
+        with get_conn() as conn:
+            # 1) audit: received
+            try:
+                audit_insert(conn, payload_id, "received", body)
+            except Exception as e_aud:
+                # não bloqueia o fluxo principal
+                print(f"⚠️ auditoria received falhou: {e_aud}")
 
-            if payload_id and audit_res.rowcount == 0:
-                print(f"🔁 DEDUPE: payload_id={payload_id} já processado")
-                return jsonify({"ok": True, "deduped": True}), 200
+            if dry_run:
+                conn.commit()
+                return jsonify({
+                    "ok": True,
+                    "dry_run": True,
+                    "received": True,
+                    "member_id": None
+                }), 200
 
-            # 2) Upsert do membro (doc = RQE), validacao pendente/sbcp
-            row = conn.execute(text("""
-                INSERT INTO membersnextlevel (nome, email, doc, metadata, validacao_acesso, portal_validado, created_at)
-                VALUES (:nome, :email, :doc, jsonb_build_object('celular', :celular), 'pending', 'sbcp', NOW())
-                ON CONFLICT (email) DO UPDATE
-                  SET nome = EXCLUDED.nome,
-                      doc  = EXCLUDED.doc,
-                      metadata = COALESCE(membersnextlevel.metadata, '{}'::jsonb) || EXCLUDED.metadata,
-                      validacao_acesso = 'pending',
-                      portal_validado  = 'sbcp'
-                RETURNING id
-            """), {"nome": nome, "email": email, "doc": rqe, "celular": celular}).first()
+            # 2) upsert membro
+            mid = upsert_member(
+                conn,
+                nome=nome,
+                email=email,
+                celular=celular,
+                rqe=rqe,
+                raw_source={"payload_id": payload_id, **raw_source},
+            )
 
-            if row is None:
-                row = conn.execute(text("SELECT id FROM membersnextlevel WHERE email = :email"),
-                                   {"email": email}).first()
-            if row is None:
-                raise RuntimeError("Não foi possível obter member_id após upsert")
-            member_id = row[0]
+            # 3) cria job idempotente
+            enqueue_validation_job(conn, member_id=mid, nome=nome, email=email)
 
-            # 3) Enfileira job PENDING (idempotente por member_id)
-            conn.execute(text("""
-                INSERT INTO validations_jobs (member_id, email, nome, fonte, status, attempts, created_at)
-                VALUES (:mid, :email, :nome, 'sbcp', 'PENDING', 0, NOW())
-                ON CONFLICT (member_id) DO NOTHING
-            """), {"mid": member_id, "email": email, "nome": nome})
+            # 4) audit: inserted
+            try:
+                audit_insert(conn, payload_id, "inserted", body)
+            except Exception as e_aud2:
+                print(f"⚠️ auditoria inserted falhou: {e_aud2}")
 
-        print(f"✅ PROCESSADO: member_id={member_id} → pending/sbcp")
-        return jsonify({"ok": True, "member_id": member_id, "status": "pending"}), 200
+            conn.commit()
+
+        return jsonify({
+            "ok": True,
+            "member_id": mid,
+            "queued": True,
+            "fonte_job": PORTAL_VALIDADO
+        }), 200
 
     except Exception as e:
-        print("💥 ERRO HANDLER:", repr(e))
+        # Erro operacional: registrar na auditoria como "error"
+        err_txt = f"{type(e).__name__}('{str(e)}')"
+        print(f"💥 ERRO HANDLER: {err_txt}")
         try:
-            with ENGINE.begin() as conn:
-                conn.execute(text("""
-                    INSERT INTO validations_log (member_id, fonte, status, payload, created_at)
-                    VALUES (NULL, 'webflow', 'error', :payload, NOW())
-                """), {"payload": json.dumps({"error": str(e), "body": body})})
-        except Exception as ee:
-            print("⚠️ falhou ao logar erro:", repr(ee))
+            with get_conn() as conn2:
+                audit_insert(conn2, payload_id, "error", {
+                    "body": body,
+                    "exception": err_txt,
+                    "traceback": traceback.format_exc(limit=3)
+                })
+                conn2.commit()
+        except Exception as e2:
+            print(f"⚠️ falhou ao logar erro em auditoria: {e2}")
+
         return jsonify({"ok": False, "error": str(e)}), 500
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")), debug=True)
+# ------------------------------------------------------------------------------
+# healthcheck simples
+# ------------------------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"ok": True, "service": "webflow-webhook", "time": datetime.utcnow().isoformat() + "Z"}), 200
 
+
+if __name__ == "__main__":
+    # para rodar local:  python webflow_payloads.py
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))

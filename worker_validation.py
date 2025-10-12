@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Worker que consome validation_jobs:
+Worker que consome validations_jobs:
 - Pega o próximo job com status PENDING (com lock).
 - Marca RUNNING, incrementa attempts.
 - Executa validação (SBCP) chamando consulta_medicos.buscar_sbcp(...)
@@ -44,7 +44,7 @@ def fetch_next_job(conn) -> Optional[Dict[str, Any]]:
         cur.execute(
             """
             SELECT id, member_id, email, nome, fonte, status, attempts
-              FROM validation_jobs
+              FROM validations_jobs
              WHERE status = 'PENDING'
              ORDER BY id
              FOR UPDATE SKIP LOCKED
@@ -59,7 +59,7 @@ def mark_running(conn, job_id: int, attempts: int) -> None:
     with conn.cursor() as cur:
         cur.execute(
             """
-            UPDATE validation_jobs
+            UPDATE validations_jobs
                SET status = 'RUNNING',
                    attempts = %s
              WHERE id = %s
@@ -72,7 +72,7 @@ def finalize_job(conn, job_id: int, status: str, last_error: Optional[str]) -> N
     with conn.cursor() as cur:
         cur.execute(
             """
-            UPDATE validation_jobs
+            UPDATE validations_jobs
                SET status = %s,
                    last_error = %s
              WHERE id = %s
@@ -162,3 +162,4 @@ def work_loop():
 
 if __name__ == "__main__":
     work_loop()
+

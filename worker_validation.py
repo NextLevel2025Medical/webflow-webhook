@@ -1,14 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Worker de validação:
-- Consome validations_jobs
-- Valida no site (consulta_medicos.buscar_sbcp)
-- Atualiza membersnextlevel de forma tolerante (só colunas existentes)
-- Ao final:
-    * APROVADO  -> flow 7479824
-    * PENDENTE/RECUSADO (FAILED) -> flow 7479965
-"""
-
 import os, re, time, json
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -20,12 +10,12 @@ from consulta_medicos import buscar_sbcp
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "3"))
-MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
+MAX_ATTEMPTS  = int(os.getenv("MAX_ATTEMPTS", "3"))
 
-BOTCONVERSA_API_KEY = os.getenv("BOTCONVERSA_API_KEY", "362e173a-ba27-4655-9191-b4fd735394da")
+BOTCONVERSA_API_KEY  = os.getenv("BOTCONVERSA_API_KEY", "362e173a-ba27-4655-9191-b4fd735394da")
 BOTCONVERSA_BASE_URL = os.getenv("BOTCONVERSA_BASE_URL", "https://backend.botconversa.com.br")
-FLOW_APROVADO = int(os.getenv("BOTCONVERSA_FLOW_APROVADO", "7479824"))
-FLOW_PENDENTE = int(os.getenv("BOTCONVERSA_FLOW_PENDENTE", "7479965"))
+FLOW_APROVADO        = int(os.getenv("BOTCONVERSA_FLOW_APROVADO", "7479824"))
+FLOW_PENDENTE        = int(os.getenv("BOTCONVERSA_FLOW_PENDENTE", "7479965"))
 
 def log(*args, **kwargs):
     msg = " ".join(str(a) for a in args)
@@ -41,6 +31,7 @@ def table_columns(conn, table: str, schema: str = "public") -> Set[str]:
         cur.execute("""SELECT column_name FROM information_schema.columns WHERE table_schema=%s AND table_name=%s""", (schema, table))
         return {r[0] for r in cur.fetchall()}
 
+# ---------- jobs ----------
 def fetch_next_job(conn) -> Optional[Dict[str, Any]]:
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
@@ -57,9 +48,9 @@ def fetch_next_job(conn) -> Optional[Dict[str, Any]]:
 def mark_running(conn, job_id: int, attempts: int) -> None:
     cols = table_columns(conn, "validations_jobs")
     sets, bind = [], []
-    if "status" in cols: sets.append("status='RUNNING'")
-    if "attempts" in cols: sets.append("attempts=%s"); bind.append(attempts + 1)
-    if "updated_at" in cols: sets.append("updated_at=NOW()")
+    if "status" in cols:    sets.append("status='RUNNING'")
+    if "attempts" in cols:  sets.append("attempts=%s"); bind.append(attempts + 1)
+    if "updated_at" in cols:sets.append("updated_at=NOW()")
     if not sets: return
     with conn.cursor() as cur:
         cur.execute(f"UPDATE validations_jobs SET {', '.join(sets)} WHERE id=%s", (*bind, job_id))
@@ -67,38 +58,84 @@ def mark_running(conn, job_id: int, attempts: int) -> None:
 def finalize_job(conn, job_id: int, status: str, last_error: Optional[str]) -> None:
     cols = table_columns(conn, "validations_jobs")
     sets, bind = [], []
-    if "status" in cols: sets.append("status=%s"); bind.append(status)
-    if "last_error" in cols: sets.append("last_error=%s"); bind.append(last_error)
-    if "updated_at" in cols: sets.append("updated_at=NOW()")
+    if "status" in cols:      sets.append("status=%s"); bind.append(status)
+    if "last_error" in cols:  sets.append("last_error=%s"); bind.append(last_error)
+    if "updated_at" in cols:  sets.append("updated_at=NOW()")
     if not sets: return
     with conn.cursor() as cur:
         cur.execute(f"UPDATE validations_jobs SET {', '.join(sets)} WHERE id=%s", (*bind, job_id))
 
+# ---------- members ----------
 def get_member_core(conn, member_id: int) -> Optional[Dict[str, Any]]:
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SELECT id, email, nome, metadata FROM membersnextlevel WHERE id=%s", (member_id,))
         row = cur.fetchone()
         return dict(row) if row else None
 
-def update_member_status(conn, member_id: int, status_txt: str, fonte: str):
+def get_phone_by_member(conn, member_id: int) -> str:
+    with conn.cursor() as cur:
+        cur.execute("SELECT metadata->>'phone' FROM membersnextlevel WHERE id=%s", (member_id,))
+        row = cur.fetchone()
+        return (row[0] or "") if row else ""
+
+def update_member_after_result(conn, member_id: int, fonte: str, result: Dict[str, Any], expected_doc: str):
+    """
+    Atualiza colunas se existirem:
+      - validacao_acesso ('aprovado' | 'pendente')
+      - portal_validado (fonte ex.: 'sbcp')
+      - validacao_at (NOW)
+      - doc / rqe / crm / crefito (se disponíveis)
+      - metadata merge: {"validation_result": result}
+    """
     cols = table_columns(conn, "membersnextlevel")
     sets, bind = [], []
-    if "status_validation" in cols: sets.append("status_validation=%s"); bind.append(status_txt)
-    if "fonte_validation" in cols: sets.append("fonte_validation=%s"); bind.append(fonte)
-    if "updated_at" in cols: sets.append("updated_at=NOW()")
+
+    status_txt = "aprovado" if result.get("ok") else "pendente"
+
+    if "validacao_acesso" in cols:
+        sets.append("validacao_acesso=%s"); bind.append(status_txt)
+    if "portal_validado" in cols:
+        sets.append("portal_validado=%s"); bind.append(fonte)
+    if "validacao_at" in cols:
+        sets.append("validacao_at=NOW()")
+
+    dados = result.get("dados") or {}
+    doc_val = dados.get("rqe_padrao") or dados.get("crm_padrao") or expected_doc or None
+    if "doc" in cols and doc_val:
+        sets.append("doc=%s"); bind.append(doc_val)
+    if "rqe" in cols and dados.get("rqe_padrao"):
+        sets.append("rqe=%s"); bind.append(dados.get("rqe_padrao"))
+    if "crm" in cols and dados.get("crm_padrao"):
+        sets.append("crm=%s"); bind.append(dados.get("crm_padrao"))
+    if "crefito" in cols and dados.get("crefito_padrao"):
+        sets.append("crefito=%s"); bind.append(dados.get("crefito_padrao"))
+
+    if "metadata" in cols:
+        patch = json.dumps({"validation_result": result}, ensure_ascii=False)
+        sets.append("metadata = COALESCE(metadata,'{}'::jsonb) || %s::jsonb"); bind.append(patch)
+
+    if "updated_at" in cols:
+        sets.append("updated_at=NOW()")
+
     if not sets: return
     with conn.cursor() as cur:
         cur.execute(f"UPDATE membersnextlevel SET {', '.join(sets)} WHERE id=%s", (*bind, member_id))
 
-def save_member_botconversa_id(conn, member_id: int, subscriber_id: int) -> None:
-    cols = table_columns(conn, "membersnextlevel")
-    if "metadata" not in cols: return
-    sets = ["metadata = COALESCE(metadata,'{}'::jsonb) || %s::jsonb"]
-    bind = [json.dumps({"botconversa_id": subscriber_id}, ensure_ascii=False)]
-    if "updated_at" in cols: sets.append("updated_at=NOW()")
+# ---------- extra: logs ----------
+def insert_validation_log(conn, member_id: int, fonte: str, status_txt: str, payload: Dict[str, Any]):
+    if "validations_log" not in get_tables(conn): return
     with conn.cursor() as cur:
-        cur.execute(f"UPDATE membersnextlevel SET {', '.join(sets)} WHERE id=%s", (*bind, member_id))
+        cur.execute(
+            "INSERT INTO validations_log (member_id, fonte, status, payload, created_at) VALUES (%s,%s,%s,%s::jsonb,NOW())",
+            (member_id, fonte, status_txt, json.dumps({"raw": payload}, ensure_ascii=False)),
+        )
 
+def get_tables(conn) -> Set[str]:
+    with conn.cursor() as cur:
+        cur.execute("""SELECT table_name FROM information_schema.tables WHERE table_schema='public'""")
+        return {r[0] for r in cur.fetchall()}
+
+# ---------- helpers de documento ----------
 def only_digits(s: Optional[str]) -> str:
     return re.sub(r"\D", "", s or "")
 
@@ -114,51 +151,31 @@ def _safe_lower_dict(d: Any) -> Dict[str, Any]:
     return {str(k).lower(): v for k, v in d.items()}
 
 def _extract_data_from_raw_payload(raw_payload: Any) -> Dict[str, Any]:
-    """
-    Suporta:
-      metadata.raw_payload.data
-      metadata.raw_payload.payload.data
-    """
     if not isinstance(raw_payload, dict):
-        try:
-            raw_payload = json.loads(raw_payload) if raw_payload else {}
-        except Exception:
-            raw_payload = {}
-    # caminho 1: raw_payload.data
-    data = raw_payload.get("data")
-    if isinstance(data, dict):
-        return _safe_lower_dict(data)
-    # caminho 2: raw_payload.payload.data
-    payload = raw_payload.get("payload")
-    if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
-        return _safe_lower_dict(payload["data"])
+        try: raw_payload = json.loads(raw_payload) if raw_payload else {}
+        except Exception: raw_payload = {}
+    if isinstance(raw_payload.get("data"), dict): return _safe_lower_dict(raw_payload["data"])
+    if isinstance(raw_payload.get("payload"), dict) and isinstance(raw_payload["payload"].get("data"), dict):
+        return _safe_lower_dict(raw_payload["payload"]["data"])
     return {}
 
 def pick_member_document(conn, member_id: int) -> str:
-    """Busca doc esperado em metadata (doc/rqe/crm/crefito) ou em raw_payload.(payload.)data."""
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SELECT metadata FROM membersnextlevel WHERE id=%s", (member_id,))
         row = cur.fetchone()
         meta = row["metadata"] if row else None
     if not isinstance(meta, dict):
-        try:
-            meta = json.loads(meta) if meta else {}
-        except Exception:
-            meta = {}
+        try: meta = json.loads(meta) if meta else {}
+        except Exception: meta = {}
     lower = _safe_lower_dict(meta)
-
-    # 1) chaves raiz do metadata
     for key in ["doc", "rqe", "crm", "crefito", "rqe_cirurgião", "rqe_cirurgiao"]:
         if key in lower and lower[key]:
             return str(lower[key]).strip()
-
-    # 2) procurar em raw_payload.(payload.)data
     data = _extract_data_from_raw_payload(lower.get("raw_payload"))
     for key in ["rqe", "crm", "crefito"]:
         val = data.get(key)
         if val and str(val).strip():
             return str(val).strip()
-
     return ""
 
 def collect_identifiers_from_result(result: Dict[str, Any]) -> Set[str]:
@@ -188,12 +205,13 @@ def match_document(expected: str, extracted_ids: Set[str]) -> bool:
     if uf and f"{num}-{uf}" in extracted_ids: return True
     return num in extracted_ids
 
+# ---------- BotConversa ----------
 def bc_headers() -> Dict[str, str]:
     return {"accept": "application/json", "Content-Type": "application/json", "API-KEY": BOTCONVERSA_API_KEY}
 
 def bc_create_or_update_subscriber(phone: str, first_name: str, last_name: str) -> Optional[int]:
     url = f"{BOTCONVERSA_BASE_URL.rstrip('/')}/api/v1/webhook/subscriber/"
-    payload = {"phone": phone, "first_name": first_name, "last_name": last_name}
+    payload = {"phone": phone, "first_name": first_name, "last_name": str(last_name or "")}
     try:
         r = requests.post(url, headers=bc_headers(), json=payload, timeout=20)
         if not r.ok: log("❌ BotConversa subscriber FAIL", status=r.status_code, body=r.text); return None
@@ -234,28 +252,53 @@ def ensure_subscriber_id(conn, member: Dict[str, Any]) -> Optional[int]:
     if sid: save_member_botconversa_id(conn, member["id"], sid)
     return sid
 
-def reset_stale_running(conn, minutes: int = 10) -> int:
-    cols = table_columns(conn, "validations_jobs")
-    if "status" not in cols: return 0
+def save_member_botconversa_id(conn, member_id: int, subscriber_id: int) -> None:
+    cols = table_columns(conn, "membersnextlevel")
+    if "metadata" not in cols: return
+    sets = ["metadata = COALESCE(metadata,'{}'::jsonb) || %s::jsonb"]
+    bind = [json.dumps({"botconversa_id": subscriber_id}, ensure_ascii=False)]
+    if "updated_at" in cols: sets.append("updated_at=NOW()")
     with conn.cursor() as cur:
-        if "updated_at" in cols:
-            cur.execute(
-                """
-                UPDATE validations_jobs
-                   SET status='PENDING', last_error='stale_running_reset', updated_at=NOW()
-                 WHERE status='RUNNING'
-                   AND COALESCE(updated_at, NOW() - INTERVAL '1 day') < NOW() - (%s || ' minutes')::interval
-                """, (minutes,)
-            )
-        else:
-            cur.execute("UPDATE validations_jobs SET status='PENDING' WHERE status='RUNNING'")
+        cur.execute(f"UPDATE membersnextlevel SET {', '.join(sets)} WHERE id=%s", (*bind, member_id))
+
+# ---------- coordenação por telefone ----------
+def cancel_other_jobs_for_phone(conn, phone: str, exclude_job_id: int) -> int:
+    if not phone: return 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE validations_jobs j
+               SET status='CANCELLED', last_error='cancelled_by_other_success', updated_at=NOW()
+              FROM membersnextlevel m
+             WHERE j.member_id = m.id
+               AND m.metadata->>'phone' = %s
+               AND j.id <> %s
+               AND j.status IN ('PENDING','RUNNING')
+            """,
+            (phone, exclude_job_id),
+        )
         return cur.rowcount or 0
 
+def exists_succeeded_for_phone(conn, phone: str) -> bool:
+    if not phone: return False
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+              FROM validations_jobs j
+              JOIN membersnextlevel m ON m.id = j.member_id
+             WHERE m.metadata->>'phone' = %s
+               AND j.status = 'SUCCEEDED'
+             LIMIT 1
+            """,
+            (phone,),
+        )
+        return cur.fetchone() is not None
+
+# ---------- loop ----------
 def work_loop():
     conn = db()
     print("🚀 worker_validation iniciado", flush=True)
-    freed = reset_stale_running(conn, minutes=10)
-    if freed: print(f"🧹 destravados RUNNING: {freed}", flush=True)
 
     while True:
         try:
@@ -264,15 +307,18 @@ def work_loop():
                 if not job:
                     time.sleep(POLL_SECONDS); continue
 
-                job_id = job["id"]; member_id = job["member_id"]
-                email = job.get("email") or ""; nome = job.get("nome") or ""
-                fonte = job.get("fonte") or "sbcp"; attempts = int(job.get("attempts") or 0)
+                job_id   = job["id"]
+                member_id= job["member_id"]
+                email    = job.get("email") or ""
+                nome     = job.get("nome") or ""
+                fonte    = job.get("fonte") or "sbcp"
+                attempts = int(job.get("attempts") or 0)
 
                 if attempts >= MAX_ATTEMPTS:
                     finalize_job(conn, job_id, "FAILED", "tentativas_excedidas")
                     log(f"🧯 Job {job_id} -> FAILED (tentativas_excedidas)"); continue
 
-                log(f"⚙️  Job {job_id} -> RUNNING (attempt {attempts+1}) [member_id={member_id}]")
+                log(f"⚙️  Job {job_id} -> RUNNING (attempt {attempts + 1}) [member_id={member_id}]")
                 mark_running(conn, job_id, attempts)
 
             steps: List[str] = []
@@ -318,29 +364,40 @@ def work_loop():
                 except Exception as e:
                     last_error = f"match_erro:{e}"; status_log = "match_erro"; result["ok"] = False
 
+            # Atualiza o "banco principal"
             try:
-                update_member_status(conn, member_id, "aprovado" if result.get("ok") else "pendente", fonte)
+                update_member_after_result(conn, member_id, fonte, result, expected_doc)
             except Exception as e:
                 last_error = f"db_erro:{e}"
 
+            # Finalização + fluxos
             with conn:
                 member = get_member_core(conn, member_id) or {"id": member_id, "nome": nome, "metadata": {}}
+                phone  = get_phone_by_member(conn, member_id)
+
                 if result.get("ok"):
                     finalize_job(conn, job_id, "SUCCEEDED", None)
                     log(f"✅ Job {job_id} -> SUCCEEDED (membro {member_id}: aprovado)")
+                    # cancela outros jobs do mesmo telefone
+                    cancelled = cancel_other_jobs_for_phone(conn, phone, job_id)
+                    if cancelled: log(f"🧹 Cancelados {cancelled} job(s) antigos para phone={phone}")
+                    # envia aprovado
                     sid = ensure_subscriber_id(conn, member)
                     if sid: bc_send_flow(sid, FLOW_APROVADO)
                     else: log("⚠️ BotConversa: subscriber_id ausente; não foi possível enviar flow aprovado.")
                 else:
                     if attempts + 1 < MAX_ATTEMPTS:
-                        finalize_job(conn, job_id, "PENDING", last_error or "retry")
-                        log(f"🔁 Job {job_id} re-enfileirado (retry). status_log={status_log}")
+                        finalize_job(conn, job_id, "PENDING", last_error or "retry"); log(f"🔁 Job {job_id} re-enfileirado (retry). status_log={status_log}")
                     else:
                         finalize_job(conn, job_id, "FAILED", last_error or status_log or "erro_definitivo")
                         log(f"🧯 Job {job_id} -> FAILED definitivo. status_log={status_log}")
-                        sid = ensure_subscriber_id(conn, member)
-                        if sid: bc_send_flow(sid, FLOW_PENDENTE)
-                        else: log("⚠️ BotConversa: subscriber_id ausente; não foi possível enviar flow pendente.")
+                        # evita mandar pendência se já existe um SUCCEEDED para o mesmo telefone
+                        if not exists_succeeded_for_phone(conn, phone):
+                            sid = ensure_subscriber_id(conn, member)
+                            if sid: bc_send_flow(sid, FLOW_PENDENTE)
+                            else: log("⚠️ BotConversa: subscriber_id ausente; não foi possível enviar flow pendente.")
+                        else:
+                            log(f"🚫 Pendente suprimido: já existe SUCCEEDED para phone={phone}")
 
         except Exception as outer:
             log(f"💥 Loop erro: {outer}")

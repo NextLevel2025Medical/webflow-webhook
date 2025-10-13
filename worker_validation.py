@@ -1,12 +1,17 @@
 # -*- coding: utf-8 -*-
 """
 Worker de validação que consome validations_jobs e valida no site da SBCP.
-Regras:
-- Lê do membersnextlevel.metadata um "documento" (rqe/crm/crefito ou doc).
-- Se o documento estiver vazio -> NÃO consulta -> pendente direta.
-- Se houver documento -> consulta -> aprova somente se algum ID retornado
-  (rqe/crm/crefito, com equivalência com/sem UF) casar com o documento informado.
-- Grava logs mais conclusivos em validations_log.
+
+Fluxo:
+1) Lê um job PENDING (SKIP LOCKED).
+2) Pega o documento do membro (ordem de preferência: doc -> rqe -> crm -> crefito).
+3) Se não houver documento: marca como pendente e re-enfileira até MAX_ATTEMPTS.
+4) Se houver documento: chama buscar_sbcp(...), extrai IDs do perfil e compara.
+5) Loga em validations_log e atualiza membersnextlevel.status_validation.
+6) SUCCEEDED se casou; caso contrário re-enfileira até MAX_ATTEMPTS e então FAILED.
+
+Compatível com a versão nova do consulta_medicos.py:
+- Usa result["dados"] (novo) e tem fallback para result["resultados"] (antigo).
 """
 
 import os
@@ -79,13 +84,13 @@ def only_digits(s: Optional[str]) -> str:
 
 def split_number_uf(s: Optional[str]) -> Tuple[str, Optional[str]]:
     """
-    Retorna (numero_digits, UF_optional).
-    Aceita '98675-MG', '98675/MG' ou '98675' → ('98675', 'MG') ou ('98675', None)
+    Divide "12345-MG", "12345/MG", "12345 MG" em ('12345','MG').
+    Se não houver UF, retorna ('12345', None).
     """
     s = (s or "").strip().upper()
     if not s:
         return "", None
-    m = re.search(r"^(.+?)(?:-|/)([A-Z]{2})$", s)
+    m = re.search(r"^(.+?)(?:-|/|\s)([A-Z]{2})$", s)
     if m:
         numero = only_digits(m.group(1))
         uf = m.group(2)
@@ -120,44 +125,62 @@ def pick_member_document(conn, member_id: int) -> str:
 
 def collect_identifiers_from_result(result: Dict[str, Any]) -> Set[str]:
     """
-    Extrai possíveis IDs (rqe/crm/crefito) do retorno do scraper.
-    Cria um conjunto com variações equivalentes:
-      - apenas dígitos
-      - dígitos+UF quando houver (padroniza com '-')
+    Extrai possíveis IDs (rqe/crm/crefito) do retorno do scraper e gera variantes equivalentes:
+      - apenas dígitos (ex.: "32019")
+      - dígitos+UF com hífen quando houver (ex.: "32019-BA")
+    Compatível com:
+      - NOVO: result["dados"] (campos: crm/rqe/crefito, *_padrao e listas *_padrao)
+      - ANTIGO: result["resultados"][0] (mesma ideia)
     """
     ids: Set[str] = set()
-    resultados = result.get("resultados") or []
-    if not isinstance(resultados, list) or not resultados:
-        return ids
 
-    d = resultados[0] or {}
-    keys = [k for k in d.keys() if isinstance(k, str)]
-
-    def add_variants(v: Optional[str]):
+    def add_value(v: Optional[str]):
         if not v:
             return
         num, uf = split_number_uf(str(v))
         if not num:
             return
-        ids.add(num)               # sem UF
+        ids.add(num)  # só dígitos
         if uf:
-            ids.add(f"{num}-{uf}") # com UF padronizado
+            ids.add(f"{num}-{uf}")
 
-    # heurística: qualquer chave que contenha rqe/crm/crefito
-    for k in keys:
-        lk = k.lower()
-        if "rqe" in lk or "crm" in lk or "crefito" in lk:
-            add_variants(str(d.get(k)))
+    def add_list(lst: Optional[List[str]]):
+        if not lst:
+            return
+        for v in lst:
+            add_value(v)
 
-    # campos *_padrao (se existirem)
-    for k in ("rqe_padrao", "crm_padrao", "crefito_padrao"):
-        if k in d:
-            add_variants(str(d.get(k)))
+    # --- NOVO formato: dicionário em result["dados"] ---
+    d = result.get("dados") or {}
+    if isinstance(d, dict) and d:
+        # preferir *_padrao quando houver
+        add_value(d.get("crm_padrao") or d.get("crm"))
+        add_value(d.get("rqe_padrao") or d.get("rqe"))
+        add_value(d.get("crefito_padrao") or d.get("crefito"))
+
+        add_list(d.get("crms_padrao") or d.get("crms"))
+        add_list(d.get("rqes_padrao") or d.get("rqes"))
+        add_list(d.get("crefitos_padrao") or d.get("crefitos"))
+
+    # --- Fallback: antigo result["resultados"][0] ---
+    if not ids:
+        resultados = result.get("resultados") or []
+        if isinstance(resultados, list) and resultados:
+            d0 = resultados[0] or {}
+            if isinstance(d0, dict):
+                add_value(d0.get("crm_padrao") or d0.get("crm"))
+                add_value(d0.get("rqe_padrao") or d0.get("rqe"))
+                add_value(d0.get("crefito_padrao") or d0.get("crefito"))
+                add_list(d0.get("crms_padrao") or d0.get("crms"))
+                add_list(d0.get("rqes_padrao") or d0.get("rqes"))
+                add_list(d0.get("crefitos_padrao") or d0.get("crefitos"))
 
     return ids
 
 def match_document(expected: str, extracted_ids: Set[str]) -> bool:
     """
+    Verifica se o documento esperado aparece no conjunto extraído,
+    considerando equivalência com/sem UF.
     Regras de equivalência:
       - expected '98675' casa com '98675' e com '98675-MG'
       - expected '98675-MG' casa com '98675' e '98675-MG'
@@ -169,9 +192,11 @@ def match_document(expected: str, extracted_ids: Set[str]) -> bool:
     if uf:
         candidates.add(f"{num}-{uf.upper()}")
 
+    # casa com qualquer variante presente
     for cand in candidates:
         if cand in extracted_ids:
             return True
+    # fallback: se só o número estiver presente
     if num in extracted_ids:
         return True
     return False
@@ -180,8 +205,8 @@ def match_document(expected: str, extracted_ids: Set[str]) -> bool:
 # Loop principal
 # =========================
 def work_loop():
-    print(f"🧵 Worker de validação iniciado. POLL_SECONDS={POLL_SECONDS} MAX_ATTEMPTS={MAX_ATTEMPTS}")
     conn = db()
+    print("🚀 worker_validation iniciado")
 
     while True:
         try:
@@ -195,12 +220,13 @@ def work_loop():
                 member_id = job["member_id"]
                 email = job.get("email") or ""
                 nome = job.get("nome") or ""
-                # Default da fonte; ajuste para "cirurgiaplastica.org.br" se quiser etiquetar assim
+                # Default da fonte; pode ajustar p/ "cirurgiaplastica.org.br" se preferir
                 fonte = job.get("fonte") or "sbcp"
                 attempts = int(job.get("attempts") or 0)
 
                 if attempts >= MAX_ATTEMPTS:
                     finalize_job(conn, job_id, "FAILED", "tentativas_excedidas")
+                    print(f"🧯 Job {job_id} -> FAILED (tentativas_excedidas)")
                     continue
 
                 print(f"⚙️  Job {job_id} -> RUNNING (attempt {attempts + 1}) [member_id={member_id} fonte={fonte}]")
@@ -209,39 +235,41 @@ def work_loop():
             steps: List[str] = []
             result: Dict[str, Any] = {}
             last_error: Optional[str] = None
+            status_log: str = "init"
 
             # 1) Lê documento esperado do BD
             try:
                 expected_doc = pick_member_document(conn, member_id).strip()
-            except Exception as e_doc:
-                expected_doc = ""
-                steps.append(f"expected_doc_read_error:{e_doc}")
+                if not expected_doc:
+                    status_log = "sem_documento"
+                    result = {
+                        "ok": False,
+                        "reason": "documento_vazio",
+                        "steps": steps + ["documento_vazio"],
+                    }
+                else:
+                    steps.append(f"expected_doc={expected_doc}")
+            except Exception as e:
+                last_error = f"db_erro:{e}"
+                status_log = "db_erro"
+                result = {"ok": False, "reason": "db_erro", "steps": steps}
 
-            if not expected_doc:
-                # Sem documento no BD -> pendente direto
-                result = {
-                    "ok": False,
-                    "steps": steps + ["sem_documento_no_bd"],
-                    "resultados": [],
-                    "qtd": 0,
-                    "expected_doc": "",
-                    "reason": "pendente_sem_documento",
-                }
-                status_log = "pendente_sem_documento"
-
-            else:
-                # 2) Chama a fonte
+            # 2) Se houver documento, roda a consulta
+            if result.get("reason") != "documento_vazio" and not last_error:
                 try:
-                    if fonte == "sbcp":
-                        result = buscar_sbcp(member_id, nome, email, steps)
-                    else:
-                        steps.append(f"fonte_desconhecida:{fonte}")
-                        result = {"ok": False, "steps": steps, "resultados": [], "qtd": 0, "reason": "fonte_desconhecida"}
+                    result = buscar_sbcp(member_id=member_id, nome=nome, email=email, steps=steps)
+                    status_log = "executado"
+                except Exception as e:
+                    last_error = f"exec_erro:{e}"
+                    status_log = "error_execucao"
+                    result = {"ok": False, "reason": "error_execucao", "steps": steps}
 
-                    # 3) Coleta IDs extraídos e faz matching
+            # 3) Decisão (match)
+            if not last_error and result and result.get("reason") != "documento_vazio":
+                try:
                     extracted_ids = collect_identifiers_from_result(result)
                     if extracted_ids:
-                        steps.append(f"ids_extraidos={sorted(list(extracted_ids))[:8]}")
+                        steps.append(f"ids_extraidos={sorted(list(extracted_ids))}")
                     else:
                         steps.append("ids_extraidos=vazio")
 
@@ -258,11 +286,10 @@ def work_loop():
                     else:
                         status_log = "numero_registro_invalido"
                         result["ok"] = False
-
                 except Exception as e:
-                    last_error = f"exception:{e}"
-                    result = {"ok": False, "steps": steps + [last_error], "resultados": [], "qtd": 0}
-                    status_log = "error_execucao"
+                    last_error = f"match_erro:{e}"
+                    status_log = "match_erro"
+                    result["ok"] = False
 
             # 4) Log + atualização do membro
             try:

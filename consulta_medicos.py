@@ -2,22 +2,17 @@
 """
 Scraper da SBCP (cirurgiaplastica.org.br) usando Playwright (API síncrona).
 
-Principais funções públicas:
-- buscar_sbcp(member_id, nome, email, steps): executa a busca pelo nome e tenta abrir o 1º perfil; extrai todos os
-  campos exibidos no perfil em pares <dt>/<dd> dentro de ".cirurgiao-info" e normaliza CRM/RQE/CREFITO.
+Fluxo:
+1) Abre a página de busca.
+2) Preenche o nome e clica em Buscar.
+3) Clica no link "Perfil Completo" (modal; href="#0", class="cirurgiao-perfil-link").
+4) Espera o modal aparecer e extrai pares <dt>/<dd> dentro de ".cirurgiao-info".
+5) Normaliza CRM/RQE/CREFITO (ex.: "32019" e "32019-MG").
 
-Melhorias implementadas:
-1) [PATCH 1] Espera explícita do container correto de perfil (".cirurgiao-info") após abrir o 1º resultado.
-2) [PATCH 2] Extração via leitura de pares <dt>/<dd> dentro de ".cirurgiao-info"; só depois aplica normalização
-   para gerar crm_padrao, rqe_padrao, crefito_padrao (ex.: "32019" ou "32019-BA"), preservando arrays de múltiplos.
-3) [PATCH 3] Preferência por navegar por href ("/cirurgiao/") com page.goto() ao invés de click direto.
-4) [PATCH 4] Fallbacks robustos para lista dinâmica: contêineres de resultado, botão/âncora "Ver perfil",
-   cards sem href direto e mensagem de "Nenhum resultado".
-
-Extras:
-- Busca tolerante (múltiplos seletores e timeouts razoáveis).
-- Passo-a-passo detalhado em "steps" para depuração.
-- Fallback de instalação automática do Chromium (opcional) via _ensure_playwright_browsers().
+Pontos de robustez:
+- Fecha banner de cookies se aparecer.
+- Usa click com force/dispatch_event para contornar viewport.
+- Espera explícita pelo modal com múltiplos seletores de fallback.
 """
 
 import os
@@ -26,12 +21,11 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
-# Banco (opcional)
 try:
     import psycopg2
     import psycopg2.extras
 except Exception:
-    psycopg2 = None  # permite rodar sem Postgres instalado
+    psycopg2 = None
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Error as PWError
 
@@ -45,22 +39,15 @@ BASE_URL = "https://www.cirurgiaplastica.org.br/encontre-um-cirurgiao/#busca-cir
 def _digits(s: str) -> str:
     return re.sub(r"\D", "", s or "")
 
-
 def _num_uf(s: str) -> str:
-    """
-    Normaliza valores como: "12345 MG", "12345/MG", "12345-MG" -> "12345-MG"
-    Se não houver UF, devolve apenas o número. Mantém somente a primeira ocorrência.
-    """
     s = (s or "").upper().strip()
     if not s:
         return ""
     m = re.search(r"(\d+)\s*(?:[-/ ]\s*([A-Z]{2}))?", s)
     if not m:
         return _digits(s)
-    num = m.group(1)
-    uf = m.group(2)
+    num = m.group(1); uf = m.group(2)
     return f"{num}-{uf}" if uf else num
-
 
 def _strip_accents_lower(s: str) -> str:
     import unicodedata
@@ -69,12 +56,7 @@ def _strip_accents_lower(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip().lower()
     return s.rstrip(":")
 
-
 def _split_multi_ids(v: Optional[str]) -> List[str]:
-    """
-    De uma string possível com múltiplos IDs, extrai todos os “número[-/ ]UF?”,
-    ex.: "CRM 41255 / MG, RQE 32019" -> ["41255 MG", "32019"]
-    """
     if not v:
         return []
     found = re.findall(r"\d+\s*(?:[-/ ]\s*[A-Z]{2})?", v.upper())
@@ -89,11 +71,7 @@ def get_conn() -> Optional["psycopg2.extensions.connection"]:
         return None
     return psycopg2.connect(DATABASE_URL)
 
-
 def log_validation(conn, member_id: int, fonte: str, status: str, payload: Dict[str, Any]) -> None:
-    """
-    Insere um registro em validations_log. Opcional.
-    """
     if not conn:
         return
     with conn.cursor() as cur:
@@ -106,11 +84,7 @@ def log_validation(conn, member_id: int, fonte: str, status: str, payload: Dict[
         )
     conn.commit()
 
-
 def set_member_validation(conn, member_id: int, status: str, fonte: str) -> None:
-    """
-    Atualiza membersnextlevel.status_validation e .fonte_validation. Opcional.
-    """
     if not conn:
         return
     with conn.cursor() as cur:
@@ -126,7 +100,6 @@ def set_member_validation(conn, member_id: int, status: str, fonte: str) -> None
         )
     conn.commit()
 
-
 def json_dumps(obj: Any) -> str:
     import json
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
@@ -136,10 +109,6 @@ def json_dumps(obj: Any) -> str:
 # Playwright helpers
 # =========================
 def _ensure_playwright_browsers(steps: List[str]) -> None:
-    """
-    Opcional: tenta instalar chromium caso não esteja disponível no container.
-    Útil para ambientes como Render em first-boot.
-    """
     try:
         steps.append("try_playwright_install_check")
         with sync_playwright() as p:
@@ -159,11 +128,7 @@ def _ensure_playwright_browsers(steps: List[str]) -> None:
         except Exception as e2:
             steps.append(f"chromium_install_error:{e2}")
 
-
 def _try_select(page, selectors: List[str], timeout: int = 10000, steps: Optional[List[str]] = None):
-    """
-    Tenta localizar o primeiro seletor visível dentre os candidatos.
-    """
     for css in selectors:
         try:
             loc = page.locator(css).first
@@ -175,18 +140,12 @@ def _try_select(page, selectors: List[str], timeout: int = 10000, steps: Optiona
             continue
     raise PWTimeout(f"Nenhum seletor correspondente ficou visível: {selectors}")
 
-
 def _maybe_close_cookie_banner(page, steps: List[str]) -> None:
-    """
-    Fecha banners de cookies/conformidade que atrapalham clique/navegação.
-    Silencioso se nada for encontrado.
-    """
     candidates = [
         "#onetrust-accept-btn-handler",
         "button:has-text('Aceitar')",
         "button:has-text('Accept')",
-        ".cli_action_button",            # Cookie Law Info
-        ".cli_settings_button",
+        ".cli_action_button",
         ".cc-btn",
         "button:has-text('Ok')",
         "button:has-text('Fechar')",
@@ -206,16 +165,12 @@ def _maybe_close_cookie_banner(page, steps: List[str]) -> None:
 
 
 # =========================
-# EXTRAÇÃO do perfil (PATCH 2)
+# EXTRAÇÃO do perfil (lendo dt/dd)
 # =========================
 def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
-    """
-    Extrai todos os dados do perfil lendo pares <dt>/<dd> dentro de .cirurgiao-info.
-    Depois normaliza CRM/RQE/CREFITO. Mantém arrays *_padrao se houver múltiplos.
-    """
     dados: Dict[str, Any] = {}
 
-    # Nome (fora ou dentro do container)
+    # Nome
     try:
         nome_sel = page.locator("h1, h2, .perfil-nome, .titulo-perfil").first
         nome_txt = nome_sel.inner_text(timeout=3000).strip()
@@ -228,7 +183,7 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
     # Container principal
     container = page.locator(".cirurgiao-info").first
     try:
-        container.wait_for(state="visible", timeout=3000)
+        container.wait_for(state="visible", timeout=5000)
     except Exception:
         steps.append("miss_cirurgiao_info")
         return dados
@@ -244,7 +199,6 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
     n = min(len(dt_texts), len(dd_texts))
     steps.append(f"pares_dt_dd={n}")
 
-    # Mapa bruto: chave normalizada -> valor raw
     raw_map: Dict[str, str] = {}
     for i in range(n):
         k_raw = dt_texts[i]
@@ -253,16 +207,11 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
         raw_map[k] = v_raw
         dados.setdefault("_raw_pairs", []).append({"k": k_raw, "v": v_raw})
 
-    # Aliases possíveis no site
+    # Aliases
     aliases = {
         "crm": ["crm", "registro crm", "crm/uf", "crm uf", "nº crm", "numero crm"],
-        "rqe": [
-            "rqe",
-            "registro de qualificacao",
-            "registro de qualificacao especialista",
-            "registro de qualificação",
-            "registro de qualificação especialista",
-        ],
+        "rqe": ["rqe", "registro de qualificacao", "registro de qualificacao especialista",
+                "registro de qualificação", "registro de qualificação especialista"],
         "crefito": ["crefito", "registro crefito", "nº crefito", "numero crefito"],
     }
 
@@ -276,7 +225,6 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
     rqe_val = first_by_alias(aliases["rqe"])
     crefito_val = first_by_alias(aliases["crefito"])
 
-    # montar listas (se houver múltiplos na string)
     crms = _split_multi_ids(crm_val)
     rqes = _split_multi_ids(rqe_val)
     crefitos = _split_multi_ids(crefito_val)
@@ -299,7 +247,6 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
         dados["crefito_padrao"] = _num_uf(crefitos[0])
         dados["crefitos_padrao"] = [_num_uf(x) for x in crefitos]
 
-    # Dump parcial do HTML para debug (opcional)
     try:
         html_snip = container.inner_html(timeout=2000)[:800]
         dados["_perfil_html_snippet"] = html_snip
@@ -307,118 +254,73 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
     except Exception:
         steps.append("perfil_html_snippet_fail")
 
-    # Mantém também o dicionário bruto (normalizado nas chaves)
     dados["_raw_map"] = raw_map
     return dados
 
 
 # =========================
-# Abertura do 1º perfil com fallbacks
+# Abertura do modal "Perfil Completo"
 # =========================
-def _open_first_profile(page, nome_busca: str, steps: List[str]) -> bool:
+def _open_profile_modal(page, steps: List[str]) -> bool:
     """
-    Tenta abrir o 1º perfil de maneira robusta:
-      1) links reais com '/cirurgiao/' -> page.goto(href)
-      2) botão/âncora "Ver perfil" dentro de contêineres de resultado
-      3) anchors genéricos dentro de cards/contêiner
-    Retorna True se conseguir abrir e carregar '.cirurgiao-info'.
+    Procura e clica no link 'Perfil Completo' que abre o modal (href="#0", class="cirurgiao-perfil-link").
+    Aguarda o modal renderizar a área '.cirurgiao-info'.
     """
-    # 1) Tenta links diretos de perfil
-    perfil_link_sel = "a[href*='/cirurgiao/']:not([href*='encontre-um-cirurgiao'])"
-    links_loc = page.locator(perfil_link_sel)
-    try:
-        if links_loc.count() > 0:
-            n_links = links_loc.count()
-            steps.append(f"resultado_apareceu:links_perfil={n_links}")
-            href = (links_loc.nth(0).get_attribute("href") or "").strip()
-            if href:
-                if not href.lower().startswith("http"):
-                    href = urljoin(BASE_URL, href)
-                steps.append(f"abrindo_href={href}")
-                page.goto(href, wait_until="domcontentloaded", timeout=45000)
-                page.locator(".cirurgiao-info").first.wait_for(state="visible", timeout=25000)
-                steps.append("perfil_container_ok:.cirurgiao-info")
-                return True
-    except Exception as e:
-        steps.append(f"perfil_link_error:{e}")
-
-    # 2) Procura contêineres de resultado e "Ver perfil"
-    containers = [
-        "#resultado_busca",
-        "#resultado-busca",
-        ".resultado-busca",
-        ".resultados",
-        ".busca-cirurgiao",
-        ".cirurgiao-lista",
-        ".cirurgiao-card",
+    # 1) Espera por algum link de perfil
+    perfil_selectors = [
+        "a.cirurgiao-perfil-link[data-code]",
+        "a.cirurgiao-perfil-link",
+        "a:has-text('Perfil Completo')",
+        "a:has-text('Perfil completo')",
+        "a[href='#0'][data-code]"
     ]
-
     try:
-        for cont in containers:
-            cont_loc = page.locator(cont)
-            if cont_loc.count() == 0:
-                continue
+        link = _try_select(page, perfil_selectors, timeout=30000, steps=steps)
+    except PWTimeout:
+        steps.append("perfil_link_nao_encontrado")
+        return False
 
-            # Botão/âncora "Ver perfil"
-            verperf = page.locator(f"{cont} a:has-text('Ver perfil'), {cont} button:has-text('Ver perfil')")
-            if verperf.count() > 0:
-                try:
-                    verperf.nth(0).scroll_into_view_if_needed(timeout=3000)
-                except Exception:
-                    pass
-                try:
-                    verperf.nth(0).click(timeout=12000, force=True)
-                    steps.append(f"click_ver_perfil:{cont}")
-                    page.locator(".cirurgiao-info").first.wait_for(state="visible", timeout=25000)
-                    steps.append("perfil_container_ok:.cirurgiao-info")
-                    return True
-                except Exception as e:
-                    steps.append(f"ver_perfil_click_fail:{e}")
-
-            # Anchors qualquer dentro do contêiner (último recurso)
-            any_a = page.locator(f"{cont} a")
-            if any_a.count() > 0:
-                try:
-                    a0 = any_a.nth(0)
-                    href = (a0.get_attribute("href") or "").strip()
-                    if href:
-                        if not href.lower().startswith("http"):
-                            href = urljoin(BASE_URL, href)
-                        steps.append(f"abrindo_href_fallback={href}")
-                        page.goto(href, wait_until="domcontentloaded", timeout=45000)
-                    else:
-                        a0.scroll_into_view_if_needed(timeout=3000)
-                        a0.click(timeout=12000, force=True)
-                        steps.append("click_anchor_fallback")
-                    page.locator(".cirurgiao-info").first.wait_for(state="visible", timeout=25000)
-                    steps.append("perfil_container_ok:.cirurgiao-info")
-                    return True
-                except Exception as e:
-                    steps.append(f"cont_a_click_fail:{e}")
+    # 2) Clique robusto (viewport/overlay)
+    try:
+        link.scroll_into_view_if_needed(timeout=2000)
+    except Exception:
+        pass
+    try:
+        link.click(timeout=12000, force=True)
+        steps.append("click_perfil_completo:force")
     except Exception as e:
-        steps.append(f"containers_iter_fail:{e}")
+        steps.append(f"click_force_fail:{e}")
+        try:
+            handle = link.element_handle(timeout=2000)
+            if handle:
+                page.dispatch_event("a.cirurgiao-perfil-link, a:has-text('Perfil Completo')", "click")
+                steps.append("click_perfil_completo:dispatch_event")
+            else:
+                raise
+        except Exception as e2:
+            steps.append(f"click_dispatch_fail:{e2}")
+            return False
 
-    return False
+    # 3) Espera o modal carregar (qualquer dos seletores abaixo)
+    modal_candidates = [
+        ".cirurgiao-info",             # conteúdo que queremos
+        ".mfp-content .cirurgiao-info",
+        ".modal .cirurgiao-info",
+        "div[role='dialog'] .cirurgiao-info",
+    ]
+    try:
+        page.wait_for_selector(", ".join(modal_candidates), timeout=30000, state="visible")
+        steps.append("perfil_modal_ok")
+        return True
+    except Exception as e:
+        steps.append(f"perfil_modal_timeout:{e}")
+        return False
 
 
 # =========================
-# BUSCA e navegação (inclui PATCHES)
+# BUSCA e navegação
 # =========================
 def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None, steps: Optional[List[str]] = None) -> Dict[str, Any]:
-    """
-    Abre a página de busca, pesquisa pelo nome, abre o 1º perfil (com fallbacks) e extrai o perfil.
-    Retorno:
-      {
-        "ok": bool,
-        "qtd": int,
-        "resultados": list,
-        "dados": dict,
-        "steps": list[str],
-        "nome_busca": str,
-        "timing_ms": int,
-        "reason": "motivo"   # se ok=False
-      }
-    """
     if steps is None:
         steps = []
     start = time.time()
@@ -426,12 +328,8 @@ def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None
 
     if not nome_busca:
         return {
-            "ok": False,
-            "qtd": 0,
-            "resultados": [],
-            "steps": steps + ["nome_vazio"],
-            "nome_busca": nome_busca,
-            "timing_ms": int((time.time() - start) * 1000),
+            "ok": False, "qtd": 0, "resultados": [], "steps": steps + ["nome_vazio"],
+            "nome_busca": nome_busca, "timing_ms": int((time.time() - start) * 1000),
             "reason": "nome_vazio",
         }
 
@@ -464,12 +362,8 @@ def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None
             except PWTimeout:
                 steps.append("falha_input_nome")
                 return {
-                    "ok": False,
-                    "qtd": 0,
-                    "resultados": [],
-                    "steps": steps,
-                    "nome_busca": nome_busca,
-                    "timing_ms": int((time.time() - start) * 1000),
+                    "ok": False, "qtd": 0, "resultados": [], "steps": steps,
+                    "nome_busca": nome_busca, "timing_ms": int((time.time() - start) * 1000),
                     "reason": "falha_input",
                 }
 
@@ -488,85 +382,47 @@ def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None
             except Exception:
                 steps.append("falha_submit")
                 return {
-                    "ok": False,
-                    "qtd": 0,
-                    "resultados": [],
-                    "steps": steps,
-                    "nome_busca": nome_busca,
-                    "timing_ms": int((time.time() - start) * 1000),
+                    "ok": False, "qtd": 0, "resultados": [], "steps": steps,
+                    "nome_busca": nome_busca, "timing_ms": int((time.time() - start) * 1000),
                     "reason": "falha_submit",
                 }
 
-            # 4) Aguarda rede assentar e tenta detectar resultados OU zero resultados
+            # 4) Aguarda rede assentar e tenta abrir o modal do primeiro perfil
             try:
                 page.wait_for_load_state("networkidle", timeout=8000)
             except Exception:
-                pass  # alguns sites não “paran” de baixar asset
-
-            # Mensagem de "nenhum resultado" (ajuste conforme o site)
-            try:
-                if page.locator("text=/Nenhum resultado|Nenhuma ocorrência|não encontrou/i").first.is_visible():
-                    steps.append("zero_resultados_detectado")
-                    return {
-                        "ok": False,
-                        "qtd": 0,
-                        "resultados": [],
-                        "steps": steps,
-                        "nome_busca": nome_busca,
-                        "timing_ms": int((time.time() - start) * 1000),
-                        "reason": "sem_resultados",
-                    }
-            except Exception:
                 pass
 
-            # 5) Tenta abrir o 1º perfil com fallbacks
-            ok_abriu = _open_first_profile(page, nome_busca, steps)
-            if not ok_abriu:
+            if not _open_profile_modal(page, steps):
                 steps.append("sem_resultados_ou_layout_alterado")
                 return {
-                    "ok": False,
-                    "qtd": 0,
-                    "resultados": [],
-                    "steps": steps,
-                    "nome_busca": nome_busca,
-                    "timing_ms": int((time.time() - start) * 1000),
+                    "ok": False, "qtd": 0, "resultados": [], "steps": steps,
+                    "nome_busca": nome_busca, "timing_ms": int((time.time() - start) * 1000),
                     "reason": "sem_resultados_ou_layout_alterado",
                 }
 
-            # 6) Extrai via dt/dd e normaliza
+            # 5) Extrai via dt/dd e normaliza
             dados = _extract_profile(page, steps)
             qtd_detectada = 1 if dados else 0
 
             return {
-                "ok": bool(dados),
-                "qtd": qtd_detectada,
-                "resultados": [],
-                "dados": dados,
-                "steps": steps,
-                "nome_busca": nome_busca,
+                "ok": bool(dados), "qtd": qtd_detectada, "resultados": [],
+                "dados": dados, "steps": steps, "nome_busca": nome_busca,
                 "timing_ms": int((time.time() - start) * 1000),
             }
 
     except PWError as e:
         steps.append(f"playwright_error:{repr(e)}")
         return {
-            "ok": False,
-            "qtd": 0,
-            "resultados": [],
-            "steps": steps,
-            "nome_busca": nome_busca,
-            "timing_ms": int((time.time() - start) * 1000),
+            "ok": False, "qtd": 0, "resultados": [], "steps": steps,
+            "nome_busca": nome_busca, "timing_ms": int((time.time() - start) * 1000),
             "reason": "playwright_browser_missing",
         }
     except Exception as e:
         steps.append(f"erro_inesperado:{repr(e)}")
         return {
-            "ok": False,
-            "qtd": 0,
-            "resultados": [],
-            "steps": steps,
-            "nome_busca": nome_busca,
-            "timing_ms": int((time.time() - start) * 1000),
+            "ok": False, "qtd": 0, "resultados": [], "steps": steps,
+            "nome_busca": nome_busca, "timing_ms": int((time.time() - start) * 1000),
             "reason": "erro_inesperado",
         }
 
@@ -575,8 +431,7 @@ def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None
 # Execução direta para testes locais
 # =========================
 if __name__ == "__main__":
-    # Teste rápido: python consulta_medicos.py "NOME DO MEDICO"
     import sys, json
-    nome_arg = " ".join(sys.argv[1:]).strip() or "JOAO SILVA"
+    nome_arg = " ".join(sys.argv[1:]).strip() or "GUSTAVO AQUINO"
     out = buscar_sbcp(member_id=None, nome=nome_arg, email=None, steps=[])
     print(json.dumps(out, ensure_ascii=False, indent=2))

@@ -1,17 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Worker de validação que consome validations_jobs e valida no site da SBCP.
+Worker de validação:
+- Consome validations_jobs
+- Valida no site (consulta_medicos.buscar_sbcp)
+- Atualiza membersnextlevel.status_validation
+- Ao final do job:
+    * APROVADO  -> envia BotConversa flow 7479824
+    * PENDENTE/RECUSADO (FAILED final) -> envia BotConversa flow 7479965
+  O envio usa o subscriber_id salvo no metadata (botconversa_id). Se não houver, cria/atualiza subscriber.
 
-Fluxo:
-1) Lê um job PENDING (SKIP LOCKED).
-2) Pega o documento do membro (ordem de preferência: doc -> rqe -> crm -> crefito).
-3) Se não houver documento: marca como pendente e re-enfileira até MAX_ATTEMPTS.
-4) Se houver documento: chama buscar_sbcp(...), extrai IDs do perfil e compara.
-5) Loga em validations_log e atualiza membersnextlevel.status_validation.
-6) SUCCEEDED se casou; caso contrário re-enfileira até MAX_ATTEMPTS e então FAILED.
-
-Compatível com a versão nova do consulta_medicos.py:
-- Usa result["dados"] (novo) e tem fallback para result["resultados"] (antigo).
+Variáveis de ambiente (com defaults):
+- DATABASE_URL
+- BOTCONVERSA_API_KEY (default: chave fornecida)
+- BOTCONVERSA_BASE_URL (default: https://backend.botconversa.com.br)
+- BOTCONVERSA_FLOW_APROVADO (default: 7479824)
+- BOTCONVERSA_FLOW_PENDENTE  (default: 7479965)
+- POLL_SECONDS (default: 3)
+- MAX_ATTEMPTS (default: 3)
 """
 
 import os
@@ -19,18 +24,26 @@ import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import requests
 import psycopg2
 import psycopg2.extras
 
-from consulta_medicos import buscar_sbcp, log_validation, set_member_validation
+from consulta_medicos import buscar_sbcp
 
+# ------------------ Config ------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "3"))
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
 
-# =========================
-# Conexão / helpers de BD
-# =========================
+BOTCONVERSA_API_KEY = os.getenv(
+    "BOTCONVERSA_API_KEY",
+    "362e173a-ba27-4655-9191-b4fd735394da"  # ideal: mover para env
+)
+BOTCONVERSA_BASE_URL = os.getenv("BOTCONVERSA_BASE_URL", "https://backend.botconversa.com.br")
+FLOW_APROVADO = int(os.getenv("BOTCONVERSA_FLOW_APROVADO", "7479824"))
+FLOW_PENDENTE = int(os.getenv("BOTCONVERSA_FLOW_PENDENTE", "7479965"))
+
+# ------------------ BD ------------------
 def db() -> psycopg2.extensions.connection:
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL não configurada")
@@ -39,7 +52,6 @@ def db() -> psycopg2.extensions.connection:
     return conn
 
 def fetch_next_job(conn) -> Optional[Dict[str, Any]]:
-    """Seleciona 1 job PENDING com SKIP LOCKED para evitar concorrência."""
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """
@@ -57,36 +69,57 @@ def fetch_next_job(conn) -> Optional[Dict[str, Any]]:
 def mark_running(conn, job_id: int, attempts: int) -> None:
     with conn.cursor() as cur:
         cur.execute(
-            """
-            UPDATE validations_jobs
-               SET status = 'RUNNING', attempts = %s
-             WHERE id = %s
-            """,
+            "UPDATE validations_jobs SET status='RUNNING', attempts=%s, updated_at=NOW() WHERE id=%s",
             (attempts + 1, job_id),
         )
 
 def finalize_job(conn, job_id: int, status: str, last_error: Optional[str]) -> None:
     with conn.cursor() as cur:
         cur.execute(
-            """
-            UPDATE validations_jobs
-               SET status = %s, last_error = %s
-             WHERE id = %s
-            """,
+            "UPDATE validations_jobs SET status=%s, last_error=%s, updated_at=NOW() WHERE id=%s",
             (status, last_error, job_id),
         )
 
-# =========================
-# Normalização & matching
-# =========================
+# ------------------ Member helpers ------------------
+def get_member_core(conn, member_id: int) -> Optional[Dict[str, Any]]:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, email, nome, metadata FROM membersnextlevel WHERE id=%s",
+            (member_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+def set_member_validation(conn, member_id: int, status: str, fonte: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE membersnextlevel
+               SET status_validation = %s,
+                   fonte_validation  = %s,
+                   updated_at        = NOW()
+             WHERE id = %s
+            """,
+            (status, fonte, member_id),
+        )
+
+def save_member_botconversa_id(conn, member_id: int, subscriber_id: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE membersnextlevel
+               SET metadata = COALESCE(metadata,'{}'::jsonb) || %s::jsonb,
+                   updated_at = NOW()
+             WHERE id = %s
+            """,
+            (psycopg2.extras.Json({"botconversa_id": subscriber_id}), member_id),
+        )
+
+# ------------------ Normalização / matching ------------------
 def only_digits(s: Optional[str]) -> str:
     return re.sub(r"\D", "", s or "")
 
 def split_number_uf(s: Optional[str]) -> Tuple[str, Optional[str]]:
-    """
-    Divide "12345-MG", "12345/MG", "12345 MG" em ('12345','MG').
-    Se não houver UF, retorna ('12345', None).
-    """
     s = (s or "").strip().upper()
     if not s:
         return "", None
@@ -98,19 +131,14 @@ def split_number_uf(s: Optional[str]) -> Tuple[str, Optional[str]]:
     return only_digits(s), None
 
 def pick_member_document(conn, member_id: int) -> str:
-    """
-    Busca um possível documento do membro nas colunas/metadata.
-    Considera metadados 'rqe', 'crm', 'crefito', 'doc' (se existir).
-    Retorna string (pode estar com UF).
-    """
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT
+                COALESCE(metadata->>'doc','')     AS doc,
                 COALESCE(metadata->>'rqe','')     AS rqe,
                 COALESCE(metadata->>'crm','')     AS crm,
-                COALESCE(metadata->>'crefito','') AS crefito,
-                COALESCE(metadata->>'doc','')     AS doc
+                COALESCE(metadata->>'crefito','') AS crefito
             FROM membersnextlevel
             WHERE id = %s
             """,
@@ -119,19 +147,10 @@ def pick_member_document(conn, member_id: int) -> str:
         row = cur.fetchone()
         if not row:
             return ""
-        # ordem de preferência: doc -> rqe -> crm -> crefito
-        doc = row[3] or row[0] or row[1] or row[2] or ""
-        return doc.strip()
+        doc = (row[0] or row[1] or row[2] or row[3] or "").strip()
+        return doc
 
 def collect_identifiers_from_result(result: Dict[str, Any]) -> Set[str]:
-    """
-    Extrai possíveis IDs (rqe/crm/crefito) do retorno do scraper e gera variantes equivalentes:
-      - apenas dígitos (ex.: "32019")
-      - dígitos+UF com hífen quando houver (ex.: "32019-BA")
-    Compatível com:
-      - NOVO: result["dados"] (campos: crm/rqe/crefito, *_padrao e listas *_padrao)
-      - ANTIGO: result["resultados"][0] (mesma ideia)
-    """
     ids: Set[str] = set()
 
     def add_value(v: Optional[str]):
@@ -140,7 +159,7 @@ def collect_identifiers_from_result(result: Dict[str, Any]) -> Set[str]:
         num, uf = split_number_uf(str(v))
         if not num:
             return
-        ids.add(num)  # só dígitos
+        ids.add(num)
         if uf:
             ids.add(f"{num}-{uf}")
 
@@ -150,19 +169,15 @@ def collect_identifiers_from_result(result: Dict[str, Any]) -> Set[str]:
         for v in lst:
             add_value(v)
 
-    # --- NOVO formato: dicionário em result["dados"] ---
     d = result.get("dados") or {}
     if isinstance(d, dict) and d:
-        # preferir *_padrao quando houver
         add_value(d.get("crm_padrao") or d.get("crm"))
         add_value(d.get("rqe_padrao") or d.get("rqe"))
         add_value(d.get("crefito_padrao") or d.get("crefito"))
-
         add_list(d.get("crms_padrao") or d.get("crms"))
         add_list(d.get("rqes_padrao") or d.get("rqes"))
         add_list(d.get("crefitos_padrao") or d.get("crefitos"))
 
-    # --- Fallback: antigo result["resultados"][0] ---
     if not ids:
         resultados = result.get("resultados") or []
         if isinstance(resultados, list) and resultados:
@@ -178,38 +193,128 @@ def collect_identifiers_from_result(result: Dict[str, Any]) -> Set[str]:
     return ids
 
 def match_document(expected: str, extracted_ids: Set[str]) -> bool:
-    """
-    Verifica se o documento esperado aparece no conjunto extraído,
-    considerando equivalência com/sem UF.
-    Regras de equivalência:
-      - expected '98675' casa com '98675' e com '98675-MG'
-      - expected '98675-MG' casa com '98675' e '98675-MG'
-    """
     if not expected:
         return False
     num, uf = split_number_uf(expected)
     candidates = {num}
     if uf:
         candidates.add(f"{num}-{uf.upper()}")
-
-    # casa com qualquer variante presente
     for cand in candidates:
         if cand in extracted_ids:
             return True
-    # fallback: se só o número estiver presente
     if num in extracted_ids:
         return True
     return False
 
-# =========================
-# Loop principal
-# =========================
+# ------------------ BotConversa ------------------
+def bc_headers() -> Dict[str, str]:
+    return {
+        "accept": "application/json",
+        "Content-Type": "application/json",
+        "API-KEY": BOTCONVERSA_API_KEY,
+    }
+
+def bc_create_or_update_subscriber(phone: str, first_name: str, last_name: str) -> Optional[int]:
+    url = f"{BOTCONVERSA_BASE_URL.rstrip('/')}/api/v1/webhook/subscriber/"
+    payload = {"phone": phone, "first_name": first_name, "last_name": last_name}
+    try:
+        r = requests.post(url, headers=bc_headers(), json=payload, timeout=20)
+        if not r.ok:
+            print("BotConversa subscriber FAIL", r.status_code, r.text, flush=True)
+            return None
+        data = r.json()
+        sid = data.get("id")
+        try:
+            return int(sid)
+        except Exception:
+            return None
+    except Exception as e:
+        print("BotConversa subscriber EXC", repr(e), flush=True)
+        return None
+
+def bc_send_flow(subscriber_id: int, flow_id: int) -> bool:
+    url = f"{BOTCONVERSA_BASE_URL.rstrip('/')}/api/v1/webhook/subscriber/{subscriber_id}/send_flow/"
+    try:
+        r = requests.post(url, headers=bc_headers(), json={"flow": flow_id}, timeout=20)
+        if not r.ok:
+            print("BotConversa send_flow FAIL", r.status_code, r.text, flush=True)
+        return bool(r.ok)
+    except Exception as e:
+        print("BotConversa send_flow EXC", repr(e), flush=True)
+        return False
+
+def split_name(full_name: str) -> Tuple[str, str]:
+    parts = [p for p in (full_name or "").strip().split() if p]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
+
+def ensure_subscriber_id(conn, member: Dict[str, Any]) -> Optional[int]:
+    """
+    Garante que teremos um subscriber_id:
+    - se já houver em metadata -> usa
+    - senão, tenta criar usando phone e nome
+    - salva no metadata quando criar
+    """
+    metadata = member.get("metadata") or {}
+    sid = metadata.get("botconversa_id")
+    if sid:
+        try:
+            return int(sid)
+        except Exception:
+            pass
+
+    phone = (metadata.get("phone") or "").strip()
+    first_name, last_name = split_name(member.get("nome") or "")
+    if not phone:
+        return None
+
+    sid = bc_create_or_update_subscriber(phone=only_digits(phone), first_name=first_name, last_name=last_name)
+    if sid:
+        save_member_botconversa_id(conn, member["id"], sid)
+    return sid
+
+# ------------------ Reaper opcional ------------------
+def reset_stale_running(conn, minutes: int = 10) -> int:
+    total = 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE validations_jobs
+                   SET status='PENDING', last_error='stale_running_reset', updated_at=NOW()
+                 WHERE status='RUNNING'
+                   AND COALESCE(updated_at, created_at, NOW() - INTERVAL '1 day')
+                       < NOW() - (%s || ' minutes')::interval
+                """,
+                (minutes,),
+            )
+            total = cur.rowcount or 0
+    except Exception:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE validations_jobs SET status='PENDING' WHERE status='RUNNING'"
+                )
+                total = cur.rowcount or 0
+        except Exception:
+            total = 0
+    return total
+
+# ------------------ Loop principal ------------------
 def work_loop():
     conn = db()
-    print("🚀 worker_validation iniciado")
+    print("🚀 worker_validation iniciado", flush=True)
+
+    freed = reset_stale_running(conn, minutes=10)
+    if freed:
+        print(f"🧹 Jobs RUNNING destravados na inicialização: {freed}", flush=True)
 
     while True:
         try:
+            # Seleciona job
             with conn:
                 job = fetch_next_job(conn)
                 if not job:
@@ -220,16 +325,15 @@ def work_loop():
                 member_id = job["member_id"]
                 email = job.get("email") or ""
                 nome = job.get("nome") or ""
-                # Default da fonte; pode ajustar p/ "cirurgiaplastica.org.br" se preferir
                 fonte = job.get("fonte") or "sbcp"
                 attempts = int(job.get("attempts") or 0)
 
                 if attempts >= MAX_ATTEMPTS:
                     finalize_job(conn, job_id, "FAILED", "tentativas_excedidas")
-                    print(f"🧯 Job {job_id} -> FAILED (tentativas_excedidas)")
+                    print(f"🧯 Job {job_id} -> FAILED (tentativas_excedidas)", flush=True)
                     continue
 
-                print(f"⚙️  Job {job_id} -> RUNNING (attempt {attempts + 1}) [member_id={member_id} fonte={fonte}]")
+                print(f"⚙️  Job {job_id} -> RUNNING (attempt {attempts + 1}) [member_id={member_id}]", flush=True)
                 mark_running(conn, job_id, attempts)
 
             steps: List[str] = []
@@ -237,16 +341,12 @@ def work_loop():
             last_error: Optional[str] = None
             status_log: str = "init"
 
-            # 1) Lê documento esperado do BD
+            # Documento esperado
             try:
                 expected_doc = pick_member_document(conn, member_id).strip()
                 if not expected_doc:
                     status_log = "sem_documento"
-                    result = {
-                        "ok": False,
-                        "reason": "documento_vazio",
-                        "steps": steps + ["documento_vazio"],
-                    }
+                    result = {"ok": False, "reason": "documento_vazio", "steps": steps + ["documento_vazio"]}
                 else:
                     steps.append(f"expected_doc={expected_doc}")
             except Exception as e:
@@ -254,7 +354,7 @@ def work_loop():
                 status_log = "db_erro"
                 result = {"ok": False, "reason": "db_erro", "steps": steps}
 
-            # 2) Se houver documento, roda a consulta
+            # Busca SBCP
             if result.get("reason") != "documento_vazio" and not last_error:
                 try:
                     result = buscar_sbcp(member_id=member_id, nome=nome, email=email, steps=steps)
@@ -264,14 +364,11 @@ def work_loop():
                     status_log = "error_execucao"
                     result = {"ok": False, "reason": "error_execucao", "steps": steps}
 
-            # 3) Decisão (match)
+            # Match
             if not last_error and result and result.get("reason") != "documento_vazio":
                 try:
                     extracted_ids = collect_identifiers_from_result(result)
-                    if extracted_ids:
-                        steps.append(f"ids_extraidos={sorted(list(extracted_ids))}")
-                    else:
-                        steps.append("ids_extraidos=vazio")
+                    steps.append(f"ids_extraidos={sorted(list(extracted_ids))}" if extracted_ids else "ids_extraidos=vazio")
 
                     is_match = match_document(expected_doc, extracted_ids)
                     result["expected_doc"] = expected_doc
@@ -291,9 +388,8 @@ def work_loop():
                     status_log = "match_erro"
                     result["ok"] = False
 
-            # 4) Log + atualização do membro
+            # Persistência (status do membro)
             try:
-                log_validation(conn, member_id, fonte, status_log, {"raw": result, "fonte": fonte})
                 if result.get("ok"):
                     set_member_validation(conn, member_id, "aprovado", fonte)
                 else:
@@ -301,21 +397,39 @@ def work_loop():
             except Exception as e:
                 last_error = f"db_erro:{e}"
 
-            # 5) Finaliza job
+            # Finalização do job + envio do flow FINAL
             with conn:
+                member = get_member_core(conn, member_id) or {"id": member_id, "nome": nome, "metadata": {}}
+
                 if result.get("ok"):
+                    # SUCCEEDED -> envia flow aprovado
                     finalize_job(conn, job_id, "SUCCEEDED", None)
-                    print(f"✅ Job {job_id} -> SUCCEEDED (membro {member_id}: aprovado/{fonte})")
+                    print(f"✅ Job {job_id} -> SUCCEEDED (membro {member_id}: aprovado)", flush=True)
+
+                    sid = ensure_subscriber_id(conn, member)
+                    if sid:
+                        bc_send_flow(sid, FLOW_APROVADO)
+                    else:
+                        print("⚠️ BotConversa: subscriber_id ausente; não foi possível enviar flow aprovado.", flush=True)
+
                 else:
+                    # Falhou nesta tentativa
                     if attempts + 1 < MAX_ATTEMPTS:
                         finalize_job(conn, job_id, "PENDING", last_error or "retry")
-                        print(f"🔁 Job {job_id} re-enfileirado (retry). status_log={status_log}")
+                        print(f"🔁 Job {job_id} re-enfileirado (retry). status_log={status_log}", flush=True)
                     else:
+                        # FAILED definitivo -> envia flow pendente/recusado
                         finalize_job(conn, job_id, "FAILED", last_error or status_log or "erro_definitivo")
-                        print(f"🧯 Job {job_id} -> FAILED definitivo. status_log={status_log}")
+                        print(f"🧯 Job {job_id} -> FAILED definitivo. status_log={status_log}", flush=True)
+
+                        sid = ensure_subscriber_id(conn, member)
+                        if sid:
+                            bc_send_flow(sid, FLOW_PENDENTE)
+                        else:
+                            print("⚠️ BotConversa: subscriber_id ausente; não foi possível enviar flow pendente.", flush=True)
 
         except Exception as outer:
-            print(f"💥 Loop erro: {outer}")
+            print(f"💥 Loop erro: {outer}", flush=True)
             time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":

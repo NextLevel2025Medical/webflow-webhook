@@ -1,42 +1,45 @@
+# -*- coding: utf-8 -*-
+"""
+Webhook (Webflow -> NextLevel) com integração BotConversa logo ao receber o cadastro.
+
+Fluxo:
+1) Recebe payload do Webflow.
+2) Normaliza dados: email, nome (split em first/last), phone.
+3) Upsert em membersnextlevel (metadata acumula info útil).
+4) Chamada 1 (BotConversa): cria/atualiza subscriber -> salva subscriber_id no metadata.
+5) Chamada 2 (BotConversa): envia FLOW de "cadastro em análise".
+6) Enfileira job em validations_jobs com status PENDING (worker faz etapa 4 depois).
+
+Variáveis de ambiente (com defaults seguros):
+- DATABASE_URL
+- BOTCONVERSA_API_KEY  (default: chave fornecida)
+- BOTCONVERSA_BASE_URL (default: https://backend.botconversa.com.br)
+- BOTCONVERSA_FLOW_ANALISE (default: 7479821)
+"""
+
 import os
 import json
 from datetime import datetime
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, Any
 
+import requests
 import psycopg2
 import psycopg2.extras
 from flask import Flask, request, jsonify
 
-# -----------------------------------------------------------------------------
-# Flask app (precisa existir como variável de módulo para o Gunicorn encontrá-la)
-# -----------------------------------------------------------------------------
 app = Flask(__name__)
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
-def _env(name, default=None):
-    v = os.environ.get(name)
-    return v if v not in (None, "") else default
-
-DATABASE_URL = (
-    _env("DATABASE_URL")
-    or f"postgresql://{_env('PGUSER','neon')}:{_env('PGPASSWORD','password')}@{_env('PGHOST','localhost')}:{_env('PGPORT','5432')}/{_env('PGDATABASE','neondb')}"
+# -------------------- Config --------------------
+DATABASE_URL = os.getenv("DATABASE_URL")
+BOTCONVERSA_API_KEY = os.getenv(
+    "BOTCONVERSA_API_KEY",
+    "362e173a-ba27-4655-9191-b4fd735394da"  # ⚠️ se possível, mova para variável de ambiente
 )
+BOTCONVERSA_BASE_URL = os.getenv("BOTCONVERSA_BASE_URL", "https://backend.botconversa.com.br")
+BOTCONVERSA_FLOW_ANALISE = int(os.getenv("BOTCONVERSA_FLOW_ANALISE", "7479821"))
 
-AUDIT_TABLE = _env("AUDIT_TABLE", "public.webhook_members_audit")
-MEMBERS_TABLE = _env("MEMBERS_TABLE", "public.membersnextlevel")
-JOBS_TABLE    = _env("JOBS_TABLE", "public.validations_jobs")  # nome com S
-
-# -----------------------------------------------------------------------------
-# DB helpers
-# -----------------------------------------------------------------------------
-def db():
-    # autocommit False para controlar transações
-    conn = psycopg2.connect(DATABASE_URL)
-    return conn
-
-def jdump(obj) -> str:
+# -------------------- Utils --------------------
+def jdump(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 def log(*args, **kwargs):
@@ -45,177 +48,241 @@ def log(*args, **kwargs):
         msg += " " + " ".join(f"{k}={v}" for k, v in kwargs.items())
     print(msg, flush=True)
 
-# -----------------------------------------------------------------------------
-# Parse helpers para o payload do Webflow
-# -----------------------------------------------------------------------------
-def parse_webflow_payload(body: dict) -> Tuple[str, str, str, str, dict]:
-    """
-    Retorna: (payload_id, nome, email, rqe, body_dict)
-    Lê de:
-      body['payload']['id']
-      body['payload']['data']['nome'], ['email'], ['Rqe']
-    """
-    p = body.get("payload") or {}
-    pid = str(p.get("id") or "").strip()
+def db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL não configurada")
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = True
+    return conn
 
-    data = p.get("data") or {}
-    nome  = str(data.get("nome") or "").strip()
-    email = str(data.get("email") or "").strip()
-    rqe   = str(data.get("Rqe") or "").strip()
+def only_digits(s: Optional[str]) -> str:
+    import re
+    return re.sub(r"\D", "", s or "")
 
-    return pid, nome, email, rqe, body
+def split_name(full_name: str) -> Tuple[str, str]:
+    parts = [p for p in (full_name or "").strip().split() if p]
+    if not parts:
+        return "", ""
+    if len(parts) == 1:
+        return parts[0], ""
+    return parts[0], " ".join(parts[1:])
 
-# -----------------------------------------------------------------------------
-# SQL actions
-# -----------------------------------------------------------------------------
-def insert_audit(conn, payload_id: str, fonte: str, status: str, payload: dict):
-    q = f"""
-        INSERT INTO {AUDIT_TABLE} (payload_id, fonte, status, payload, created_at)
-        VALUES (%s, %s, %s, %s, NOW())
-        ON CONFLICT (payload_id) DO NOTHING
-    """
-    with conn.cursor() as cur:
-        cur.execute(q, (payload_id, fonte, status, json.dumps(payload, ensure_ascii=False)))
-    log("🗄️  Persistência DB (audit)", status=status, payload_id=payload_id)
+def pick(d: dict, *keys) -> Optional[str]:
+    for k in keys:
+        if k in d and d[k]:
+            return str(d[k]).strip()
+    return None
 
-def upsert_member(conn, nome: str, email: str, rqe: str, raw_payload: dict, celular: Optional[str]) -> int:
-    """
-    UPSERT no membersnextlevel, preenchendo:
-      - nome, email
-      - raw (merge jsonb)
-      - metadata (merge jsonb) com celular e rqe
-      - validacao_acesso = 'pending'
-      - portal_validado  = 'sbcp' (primeiro portal que vamos tentar)
-    Retorna member_id (id).
-    """
-    # Monta jsons
-    raw_json = {"source": "webflow", "received_at": datetime.utcnow().isoformat() + "Z"}
-    # Merge do payload bruto (limitado) dentro de raw_json
-    raw_json["payload_hint"] = {
-        "has_data": bool(raw_payload.get("payload")),
-        "form": (raw_payload.get("payload") or {}).get("name"),
+# -------------------- BotConversa --------------------
+def bc_headers() -> Dict[str, str]:
+    return {
+        "accept": "application/json",
+        "Content-Type": "application/json",
+        "API-KEY": BOTCONVERSA_API_KEY,
     }
 
-    # Metadata que sempre acumulamos
-    metadata = {}
-    if celular:
-        metadata["celular"] = celular
-    if rqe:
-        metadata["rqe"] = rqe
-
-    q = f"""
-        INSERT INTO {MEMBERS_TABLE}
-          (nome, email, raw, metadata, validacao_acesso, portal_validado, created_at)
-        VALUES
-          (%s,   %s,    COALESCE(%s::jsonb,'{{}}'::jsonb),
-                 COALESCE(%s::jsonb,'{{}}'::jsonb),
-                 'pending', 'sbcp', NOW())
-        ON CONFLICT (email) DO UPDATE
-          SET nome = EXCLUDED.nome,
-              raw  = COALESCE({MEMBERS_TABLE}.raw, '{{}}'::jsonb) || EXCLUDED.raw,
-              metadata = COALESCE({MEMBERS_TABLE}.metadata, '{{}}'::jsonb) || EXCLUDED.metadata,
-              validacao_acesso = 'pending',
-              portal_validado  = 'sbcp'
-        RETURNING id
+def bc_create_or_update_subscriber(phone: str, first_name: str, last_name: str) -> Optional[int]:
     """
-    with conn.cursor() as cur:
-        cur.execute(q, (
-            nome,
-            email,
-            jdump(raw_json),
-            jdump(metadata)
-        ))
-        mid = cur.fetchone()[0]
-    log("👤 UPSERT member", email=email, id=mid)
-    return mid
-
-def enqueue_job(conn, member_id: int, nome: str, email: str):
+    POST /api/v1/webhook/subscriber/
+    body: {"phone": "31986892292", "first_name": "...", "last_name": "..."}
+    retorna int(id) ou None
     """
-    Enfileira em validations_jobs (status PENDING).
-    Requer UNIQUE(member_id, fonte) para DO NOTHING funcionar.
-    """
-    q = f"""
-        INSERT INTO {JOBS_TABLE} (member_id, email, nome, fonte, status, attempts, created_at)
-        VALUES (%s, %s, %s, 'sbcp', 'PENDING', 0, NOW())
-        ON CONFLICT (member_id, fonte) DO NOTHING
-    """
-    with conn.cursor() as cur:
-        cur.execute(q, (member_id, email, nome))
-    log("📥 Job enfileirado", member_id=member_id, email=email, fonte='sbcp', status='PENDING')
-
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
-@app.route("/healthz", methods=["GET"])
-def healthz():
-    return jsonify({"ok": True, "ts": datetime.utcnow().isoformat() + "Z"})
-
-@app.route("/webflow-webhook", methods=["POST"])
-def webflow_webhook():
-    source = "webflow"
-    dry_run = request.args.get("dry_run") in ("1", "true", "yes")
-
+    url = f"{BOTCONVERSA_BASE_URL.rstrip('/')}/api/v1/webhook/subscriber/"
+    payload = {"phone": phone, "first_name": first_name, "last_name": last_name}
     try:
-        body = request.get_json(force=True, silent=False) or {}
-    except Exception:
-        return jsonify({"ok": False, "error": "invalid-json"}), 400
-
-    payload_id, nome, email, rqe, full = parse_webflow_payload(body)
-    celular = (((full.get("payload") or {}).get("data") or {}).get("celular") or "").strip()
-
-    log("📨 WEBFLOW",
-        payload_id=payload_id or "(none)",
-        form=(full.get("payload") or {}).get("name"),
-        nome=nome, email=email, rqe=rqe)
-
-    # Validação mínima de campos
-    if not email or not nome:
-        return jsonify({"ok": False, "error": "missing nome/email"}), 400
-
-    conn = db()
-    try:
-        conn.autocommit = False
-
-        # 1) AUDITORIA (sempre registramos)
+        r = requests.post(url, headers=bc_headers(), json=payload, timeout=20)
+        if not r.ok:
+            log("BotConversa subscriber FAIL", status=r.status_code, body=r.text)
+            return None
+        data = r.json()
+        sid = data.get("id")
+        if isinstance(sid, int):
+            return sid
+        # algumas instalações retornam string
         try:
-            insert_audit(conn, payload_id or f"anon-{datetime.utcnow().timestamp()}", source, "received", full)
-        except Exception as e_audit:
-            # não bloqueia o fluxo principal
-            log("⚠️ audit-fail", err=str(e_audit))
+            return int(str(sid))
+        except Exception:
+            return None
+    except Exception as e:
+        log("BotConversa subscriber EXC", err=repr(e))
+        return None
 
-        # 2) UPSERT do membro na principal
-        member_id = upsert_member(conn, nome=nome, email=email, rqe=rqe, raw_payload=full, celular=celular)
+def bc_send_flow(subscriber_id: int, flow_id: int) -> bool:
+    """
+    POST /api/v1/webhook/subscriber/{id}/send_flow/
+    body: {"flow": 7479821}
+    """
+    url = f"{BOTCONVERSA_BASE_URL.rstrip('/')}/api/v1/webhook/subscriber/{subscriber_id}/send_flow/"
+    try:
+        r = requests.post(url, headers=bc_headers(), json={"flow": flow_id}, timeout=20)
+        ok = bool(r.ok)
+        if not ok:
+            log("BotConversa send_flow FAIL", status=r.status_code, body=r.text)
+        return ok
+    except Exception as e:
+        log("BotConversa send_flow EXC", err=repr(e))
+        return False
 
-        # 3) Enfileira job (a menos que seja dry_run)
-        if not dry_run:
-            try:
-                enqueue_job(conn, member_id=member_id, nome=nome, email=email)
-            except Exception as e_job:
-                # logamos erro na auditoria secundária (validations_log) ou apenas no console
-                log("⚠️ enqueue-fail", err=str(e_job))
-                # não damos rollback por isso — mantemos o membro salvo
+# -------------------- DB ops --------------------
+def upsert_member(conn, email: str, nome: str, phone: str, extra_meta: Dict[str, Any]) -> int:
+    """
+    Insere/atualiza membro. Usa ON CONFLICT(email) se existir unique; senão, tenta select->insert.
+    Retorna member_id.
+    """
+    metadata_json = json.dumps({"phone": phone, **extra_meta}, ensure_ascii=False)
+    # tentativa com ON CONFLICT
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO membersnextlevel (email, nome, metadata, created_at, updated_at)
+                VALUES (%s, %s, %s::jsonb, NOW(), NOW())
+                ON CONFLICT (email) DO UPDATE
+                   SET nome = EXCLUDED.nome,
+                       metadata = COALESCE(membersnextlevel.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+                       updated_at = NOW()
+                RETURNING id
+                """,
+                (email, nome, metadata_json),
+            )
+            row = cur.fetchone()
+            return int(row["id"])
+    except Exception as e:
+        log("upsert_member ON CONFLICT falhou, tentando fallback", err=repr(e))
+        # fallback select/insert
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT id FROM membersnextlevel WHERE email=%s", (email,))
+            row = cur.fetchone()
+            if row:
+                mid = int(row["id"])
+                cur.execute(
+                    """
+                    UPDATE membersnextlevel
+                       SET nome=%s,
+                           metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                           updated_at=NOW()
+                     WHERE id=%s
+                    """,
+                    (nome, metadata_json, mid),
+                )
+                return mid
+            cur.execute(
+                """
+                INSERT INTO membersnextlevel (email, nome, metadata, created_at, updated_at)
+                VALUES (%s, %s, %s::jsonb, NOW(), NOW())
+                RETURNING id
+                """,
+                (email, nome, metadata_json),
+            )
+            row = cur.fetchone()
+            return int(row["id"])
+
+def save_botconversa_id(conn, member_id: int, subscriber_id: int):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE membersnextlevel
+               SET metadata = COALESCE(metadata,'{}'::jsonb) || %s::jsonb,
+                   updated_at = NOW()
+             WHERE id = %s
+            """,
+            (json.dumps({"botconversa_id": subscriber_id}, ensure_ascii=False), member_id),
+        )
+
+def enqueue_validation_job(conn, member_id: int, email: str, nome: str, fonte: str = "sbcp"):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO validations_jobs (member_id, email, nome, fonte, status, attempts, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, 'PENDING', 0, NOW(), NOW())
+            """,
+            (member_id, email, nome, fonte),
+        )
+
+# -------------------- Payload parsing --------------------
+def parse_webflow_payload(body: dict) -> Tuple[str, str, str, Dict[str, Any]]:
+    """
+    Retorna: (email, nome_completo, phone, extra_meta)
+    Aceita Webflow form submissions em formatos comuns.
+    """
+    # Webflow pode mandar como { "data": { ...campos... } } ou direto
+    data = body.get("data") if isinstance(body, dict) and "data" in body else body
+    data = data or {}
+
+    email = pick(data, "email", "Email", "e-mail", "E-mail") or ""
+    nome = pick(data, "name", "nome", "full_name", "Full Name", "Nome") or ""
+    phone = pick(data, "phone", "telefone", "tel", "whatsapp", "Phone") or ""
+
+    # se os campos vierem em outro subobjeto (ex.: form)
+    if not email or not nome:
+        form = data.get("form") if isinstance(data.get("form"), dict) else {}
+        email = email or pick(form, "email", "Email")
+        nome = nome or pick(form, "name", "nome")
+        phone = phone or pick(form, "phone", "telefone", "whatsapp")
+
+    return email or "", nome or "", phone or "", {"raw_payload": body}
+
+# -------------------- Routes --------------------
+@app.get("/health")
+def health():
+    return jsonify({"ok": True, "ts": datetime.utcnow().isoformat()})
+
+@app.post("/webflow-webhook")
+def webflow_webhook():
+    conn = None
+    try:
+        body = request.get_json(silent=True) or {}
+        email, nome, phone, extra_meta = parse_webflow_payload(body)
+        if not email or not nome:
+            return jsonify({"ok": False, "error": "payload_invalido", "debug": {"email": email, "nome": nome}}), 400
+
+        # normalizações
+        phone_norm = only_digits(phone)
+        first_name, last_name = split_name(nome)
+
+        conn = db()
+
+        # 1) upsert do membro (salvamos phone/metadados)
+        member_id = upsert_member(conn, email=email, nome=nome, phone=phone_norm, extra_meta=extra_meta)
+        log("member_upsert_ok", member_id=member_id, email=email)
+
+        # 2) BotConversa: cria/atualiza subscriber (sempre)
+        subscriber_id = bc_create_or_update_subscriber(phone=phone_norm, first_name=first_name, last_name=last_name)
+        if subscriber_id:
+            save_botconversa_id(conn, member_id, subscriber_id)
+            log("botconversa_subscriber_ok", subscriber_id=subscriber_id)
+            # 3) envia FLOW “em análise” imediatamente
+            sent = bc_send_flow(subscriber_id, BOTCONVERSA_FLOW_ANALISE)
+            log("botconversa_send_flow", ok=sent, flow_id=BOTCONVERSA_FLOW_ANALISE)
         else:
-            log("🧪 dry_run=1 → não criei job")
+            log("botconversa_subscriber_none")
 
-        conn.commit()
+        # 4) enfileira validação para o worker (etapa 4 do seu processo)
+        enqueue_validation_job(conn, member_id=member_id, email=email, nome=nome, fonte="sbcp")
+        log("validation_job_enqueued", member_id=member_id)
+
         return jsonify({
             "ok": True,
             "member_id": member_id,
-            "queued": (not dry_run),
-            "payload_id": payload_id
+            "subscriber_id": subscriber_id,
+            "flow_id": BOTCONVERSA_FLOW_ANALISE
         })
+
     except Exception as e:
-        conn.rollback()
-        log("💥 ERRO HANDLER", err=repr(e))
+        if conn:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        log("webhook_error", err=repr(e))
         return jsonify({"ok": False, "error": str(e)}), 500
     finally:
-        try:
-            conn.close()
-        except:
-            pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-# -----------------------------------------------------------------------------
-# Dev server local (não usado no Render com gunicorn)
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
+    # Para rodar local: python webflow_payloads.py
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))

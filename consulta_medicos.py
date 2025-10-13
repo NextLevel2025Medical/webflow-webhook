@@ -10,8 +10,9 @@ Melhorias implementadas:
 1) [PATCH 1] Espera explícita do container correto de perfil (".cirurgiao-info") após abrir o 1º resultado.
 2) [PATCH 2] Extração via leitura de pares <dt>/<dd> dentro de ".cirurgiao-info"; só depois aplica normalização
    para gerar crm_padrao, rqe_padrao, crefito_padrao (ex.: "32019" ou "32019-BA"), preservando arrays de múltiplos.
-3) [PATCH 3] Ao invés de clicar no resultado, captura o href do link de perfil ("/cirurgiao/") e usa page.goto(href),
-   evitando clicar em links de menu como "/encontre-um-cirurgiao/".
+3) [PATCH 3] Preferência por navegar por href ("/cirurgiao/") com page.goto() ao invés de click direto.
+4) [PATCH 4] Fallbacks robustos para lista dinâmica: contêineres de resultado, botão/âncora "Ver perfil",
+   cards sem href direto e mensagem de "Nenhum resultado".
 
 Extras:
 - Busca tolerante (múltiplos seletores e timeouts razoáveis).
@@ -25,7 +26,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
-# Banco (opcional, mantido aqui só para quem quiser aproveitar)
+# Banco (opcional)
 try:
     import psycopg2
     import psycopg2.extras
@@ -175,6 +176,35 @@ def _try_select(page, selectors: List[str], timeout: int = 10000, steps: Optiona
     raise PWTimeout(f"Nenhum seletor correspondente ficou visível: {selectors}")
 
 
+def _maybe_close_cookie_banner(page, steps: List[str]) -> None:
+    """
+    Fecha banners de cookies/conformidade que atrapalham clique/navegação.
+    Silencioso se nada for encontrado.
+    """
+    candidates = [
+        "#onetrust-accept-btn-handler",
+        "button:has-text('Aceitar')",
+        "button:has-text('Accept')",
+        ".cli_action_button",            # Cookie Law Info
+        ".cli_settings_button",
+        ".cc-btn",
+        "button:has-text('Ok')",
+        "button:has-text('Fechar')",
+    ]
+    try:
+        for sel in candidates:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                try:
+                    loc.click(timeout=1500)
+                    steps.append(f"cookie_banner_closed:{sel}")
+                    break
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+
 # =========================
 # EXTRAÇÃO do perfil (PATCH 2)
 # =========================
@@ -283,11 +313,100 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
 
 
 # =========================
-# BUSCA e navegação (inclui PATCH 1 e PATCH 3)
+# Abertura do 1º perfil com fallbacks
+# =========================
+def _open_first_profile(page, nome_busca: str, steps: List[str]) -> bool:
+    """
+    Tenta abrir o 1º perfil de maneira robusta:
+      1) links reais com '/cirurgiao/' -> page.goto(href)
+      2) botão/âncora "Ver perfil" dentro de contêineres de resultado
+      3) anchors genéricos dentro de cards/contêiner
+    Retorna True se conseguir abrir e carregar '.cirurgiao-info'.
+    """
+    # 1) Tenta links diretos de perfil
+    perfil_link_sel = "a[href*='/cirurgiao/']:not([href*='encontre-um-cirurgiao'])"
+    links_loc = page.locator(perfil_link_sel)
+    try:
+        if links_loc.count() > 0:
+            n_links = links_loc.count()
+            steps.append(f"resultado_apareceu:links_perfil={n_links}")
+            href = (links_loc.nth(0).get_attribute("href") or "").strip()
+            if href:
+                if not href.lower().startswith("http"):
+                    href = urljoin(BASE_URL, href)
+                steps.append(f"abrindo_href={href}")
+                page.goto(href, wait_until="domcontentloaded", timeout=45000)
+                page.locator(".cirurgiao-info").first.wait_for(state="visible", timeout=25000)
+                steps.append("perfil_container_ok:.cirurgiao-info")
+                return True
+    except Exception as e:
+        steps.append(f"perfil_link_error:{e}")
+
+    # 2) Procura contêineres de resultado e "Ver perfil"
+    containers = [
+        "#resultado_busca",
+        "#resultado-busca",
+        ".resultado-busca",
+        ".resultados",
+        ".busca-cirurgiao",
+        ".cirurgiao-lista",
+        ".cirurgiao-card",
+    ]
+
+    try:
+        for cont in containers:
+            cont_loc = page.locator(cont)
+            if cont_loc.count() == 0:
+                continue
+
+            # Botão/âncora "Ver perfil"
+            verperf = page.locator(f"{cont} a:has-text('Ver perfil'), {cont} button:has-text('Ver perfil')")
+            if verperf.count() > 0:
+                try:
+                    verperf.nth(0).scroll_into_view_if_needed(timeout=3000)
+                except Exception:
+                    pass
+                try:
+                    verperf.nth(0).click(timeout=12000, force=True)
+                    steps.append(f"click_ver_perfil:{cont}")
+                    page.locator(".cirurgiao-info").first.wait_for(state="visible", timeout=25000)
+                    steps.append("perfil_container_ok:.cirurgiao-info")
+                    return True
+                except Exception as e:
+                    steps.append(f"ver_perfil_click_fail:{e}")
+
+            # Anchors qualquer dentro do contêiner (último recurso)
+            any_a = page.locator(f"{cont} a")
+            if any_a.count() > 0:
+                try:
+                    a0 = any_a.nth(0)
+                    href = (a0.get_attribute("href") or "").strip()
+                    if href:
+                        if not href.lower().startswith("http"):
+                            href = urljoin(BASE_URL, href)
+                        steps.append(f"abrindo_href_fallback={href}")
+                        page.goto(href, wait_until="domcontentloaded", timeout=45000)
+                    else:
+                        a0.scroll_into_view_if_needed(timeout=3000)
+                        a0.click(timeout=12000, force=True)
+                        steps.append("click_anchor_fallback")
+                    page.locator(".cirurgiao-info").first.wait_for(state="visible", timeout=25000)
+                    steps.append("perfil_container_ok:.cirurgiao-info")
+                    return True
+                except Exception as e:
+                    steps.append(f"cont_a_click_fail:{e}")
+    except Exception as e:
+        steps.append(f"containers_iter_fail:{e}")
+
+    return False
+
+
+# =========================
+# BUSCA e navegação (inclui PATCHES)
 # =========================
 def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None, steps: Optional[List[str]] = None) -> Dict[str, Any]:
     """
-    Abre a página de busca, pesquisa pelo nome, abre o 1º perfil por navegação via href e extrai o perfil.
+    Abre a página de busca, pesquisa pelo nome, abre o 1º perfil (com fallbacks) e extrai o perfil.
     Retorno:
       {
         "ok": bool,
@@ -329,8 +448,9 @@ def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None
             steps.append("launch chromium")
             page.goto(BASE_URL, wait_until="domcontentloaded", timeout=45000)
             steps.append(f"abrindo {BASE_URL}")
+            _maybe_close_cookie_banner(page, steps)
 
-            # 2) Preenche campo de nome (tentando vários seletores com fallback)
+            # 2) Preenche campo de nome
             nome_selectors = [
                 "input#cirurgiao_nome",
                 "input[name='cirurgiao_nome']",
@@ -353,7 +473,7 @@ def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None
                     "reason": "falha_input",
                 }
 
-            # 3) Clica em buscar
+            # 3) Submete busca
             submit_selectors = [
                 "input#cirurgiao_submit",
                 "button#cirurgiao_submit",
@@ -377,23 +497,31 @@ def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None
                     "reason": "falha_submit",
                 }
 
-            # 4) Espera por links REAIS de perfil (evita clicar no menu do topo)
-            perfil_link_sel = "a[href*='/cirurgiao/']:not([href*='encontre-um-cirurgiao'])"
+            # 4) Aguarda rede assentar e tenta detectar resultados OU zero resultados
             try:
-                page.wait_for_selector(perfil_link_sel, timeout=30000)
-                links_loc = page.locator(perfil_link_sel)
-                n_links = links_loc.count()
-                steps.append(f"resultado_apareceu:links_perfil={n_links}")
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except Exception:
+                pass  # alguns sites não “paran” de baixar asset
 
-                # DEBUG: registra até 5 hrefs para auditoria
-                hrefs = []
-                for i in range(min(n_links, 5)):
-                    try:
-                        hrefs.append(links_loc.nth(i).get_attribute("href") or "")
-                    except Exception:
-                        hrefs.append("")
-                steps.append(f"hrefs_top={hrefs}")
-            except PWTimeout:
+            # Mensagem de "nenhum resultado" (ajuste conforme o site)
+            try:
+                if page.locator("text=/Nenhum resultado|Nenhuma ocorrência|não encontrou/i").first.is_visible():
+                    steps.append("zero_resultados_detectado")
+                    return {
+                        "ok": False,
+                        "qtd": 0,
+                        "resultados": [],
+                        "steps": steps,
+                        "nome_busca": nome_busca,
+                        "timing_ms": int((time.time() - start) * 1000),
+                        "reason": "sem_resultados",
+                    }
+            except Exception:
+                pass
+
+            # 5) Tenta abrir o 1º perfil com fallbacks
+            ok_abriu = _open_first_profile(page, nome_busca, steps)
+            if not ok_abriu:
                 steps.append("sem_resultados_ou_layout_alterado")
                 return {
                     "ok": False,
@@ -405,62 +533,8 @@ def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None
                     "reason": "sem_resultados_ou_layout_alterado",
                 }
 
-            # (opcional) tentar priorizar um link que contenha parte do nome
-            try:
-                pedaco = nome_busca.split()[0]
-                candidato = page.locator(f"{perfil_link_sel}:has-text('{pedaco}')")
-                if candidato.count() > 0:
-                    links_loc = candidato
-            except Exception:
-                pass
-
-            # 5) Abre o 1º perfil por navegação direta (mais robusto que click)
-            try:
-                alvo = links_loc.nth(0)
-                href = (alvo.get_attribute("href") or "").strip()
-                if href:
-                    if not href.lower().startswith("http"):
-                        href = urljoin(BASE_URL, href)
-                    steps.append(f"abrindo_href={href}")
-                    page.goto(href, wait_until="domcontentloaded", timeout=45000)
-                    steps.append("abriu_perfil_primeiro_resultado:goto")
-                else:
-                    # fallback: forçar clique com scroll, se por algum motivo não houver href
-                    alvo.scroll_into_view_if_needed(timeout=5000)
-                    alvo.click(force=True, timeout=15000)
-                    steps.append("abriu_perfil_primeiro_resultado:click")
-            except Exception as e:
-                steps.append(f"erro_abrir_perfil:{e}")
-                return {
-                    "ok": False,
-                    "qtd": 0,
-                    "resultados": [],
-                    "steps": steps,
-                    "nome_busca": nome_busca,
-                    "timing_ms": int((time.time() - start) * 1000),
-                    "reason": "falha_abrir_perfil",
-                }
-
-            # 6) [PATCH 1]: esperar explicitamente o container de perfil
-            try:
-                page.locator(".cirurgiao-info").first.wait_for(state="visible", timeout=25000)
-                steps.append("perfil_container_ok:.cirurgiao-info")
-            except Exception as e:
-                steps.append(f"perfil_container_timeout:{e}")
-                return {
-                    "ok": False,
-                    "qtd": 0,
-                    "resultados": [],
-                    "steps": steps,
-                    "nome_busca": nome_busca,
-                    "timing_ms": int((time.time() - start) * 1000),
-                    "reason": "falha_abrir_perfil",
-                }
-
-            # 7) [PATCH 2]: extrair via dt/dd e normalizar
+            # 6) Extrai via dt/dd e normaliza
             dados = _extract_profile(page, steps)
-
-            # 8) (Opcional) tentar contar resultados a partir da página anterior — aqui fica como 1
             qtd_detectada = 1 if dados else 0
 
             return {

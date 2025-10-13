@@ -2,10 +2,12 @@
 """
 Webhook (Webflow -> NextLevel) robusto e tolerante, com integração BotConversa.
 
-- Envia o FLOW "em análise" no cadastro (default: 7479821; override via BOTCONVERSA_FLOW_ANALISE).
-- Tolerante a payloads (JSON e form), nome/email/telefone ausentes.
-- Compatível com schemas SEM created_at/updated_at/metadata.
-- NÃO usa psycopg2.sql (evita AttributeError).
+Correções principais:
+- Evita capturar o campo "name" do topo (nome do formulário, ex.: "cirurgiao").
+- Prioriza sempre os campos dentro de "data" (ou "payload.data") do webhook.
+- Reconhece 'nome', 'email', 'celular' (e sinônimos).
+- Salva raw_payload original no metadata.
+- Queries tolerantes (sem psycopg2.sql; não exige created_at/updated_at).
 
 Env:
 - DATABASE_URL
@@ -16,9 +18,7 @@ Env:
 - PORT / SERVICE_PORT        (default: 10000)
 """
 
-import os
-import re
-import json
+import os, re, json
 from datetime import datetime
 from typing import Tuple, Optional, Dict, Any, List, Set
 
@@ -30,10 +30,7 @@ from flask import Flask, request, jsonify
 # -------------------- Config --------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-BOTCONVERSA_API_KEY = os.getenv(
-    "BOTCONVERSA_API_KEY",
-    "362e173a-ba27-4655-9191-b4fd735394da"
-)
+BOTCONVERSA_API_KEY = os.getenv("BOTCONVERSA_API_KEY", "362e173a-ba27-4655-9191-b4fd735394da")
 BOTCONVERSA_BASE_URL = os.getenv("BOTCONVERSA_BASE_URL", "https://backend.botconversa.com.br")
 BOTCONVERSA_FLOW_ANALISE = int(os.getenv("BOTCONVERSA_FLOW_ANALISE", "7479821"))
 
@@ -55,9 +52,6 @@ def db():
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = True
     return conn
-
-def jdump(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 def only_digits(s: Optional[str]) -> str:
     return re.sub(r"\D", "", s or "")
@@ -83,81 +77,37 @@ def split_name(full_name: str) -> Tuple[str, str]:
 def lower_keys(d: Dict[str, Any]) -> Dict[str, Any]:
     return {str(k).strip().lower(): v for k, v in d.items()}
 
-def first_present(d: Dict[str, Any], *keys) -> Optional[str]:
+def first_present(d: Dict[str, Any], keys: List[str]) -> Optional[str]:
     for k in keys:
         if k in d and d[k] not in (None, "", []):
             return str(d[k]).strip()
     return None
 
-def coalesce_payload() -> Dict[str, Any]:
-    base: Dict[str, Any] = {}
-
+def extract_original_json() -> Dict[str, Any]:
+    """Retorna o JSON original do request (ou {} se não houver)."""
     j = request.get_json(silent=True)
-    if isinstance(j, dict):
-        base.update(j)
+    return j if isinstance(j, dict) else {}
 
-    if request.form:
-        for k in request.form:
-            base.setdefault(k, request.form.get(k))
-
-    if request.args:
-        for k in request.args:
-            base.setdefault(k, request.args.get(k))
-
-    # Camada "data" / "form" frequente em Webflow/Zapier
-    if isinstance(base.get("data"), dict):
-        data = base["data"].copy()
-        if isinstance(data.get("form"), dict):
-            nested = {**data, **data["form"]}
-            nested.pop("form", None)
-            return lower_keys(nested)
-        return lower_keys(data)
-
-    if isinstance(base.get("payload"), dict):
-        return lower_keys(base["payload"])
-
-    return lower_keys(base)
-
-# -------------------- DB Introspection --------------------
-def table_columns(conn, table: str, schema: str = "public") -> Set[str]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT column_name
-              FROM information_schema.columns
-             WHERE table_schema = %s
-               AND table_name = %s
-            """,
-            (schema, table),
-        )
-        return {r[0] for r in cur.fetchall()}
-
-def has_unique_on_email(conn, table: str = "membersnextlevel", schema: str = "public") -> bool:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT 1
-              FROM information_schema.table_constraints tc
-              JOIN information_schema.key_column_usage kcu
-                ON tc.constraint_name = kcu.constraint_name
-               AND tc.table_schema = kcu.table_schema
-             WHERE tc.table_schema = %s
-               AND tc.table_name   = %s
-               AND tc.constraint_type IN ('UNIQUE', 'PRIMARY KEY')
-               AND kcu.column_name = 'email'
-             LIMIT 1
-            """,
-            (schema, table),
-        )
-        return cur.fetchone() is not None
+def flatten_data_block(original: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Retorna apenas os campos de interesse do bloco 'data' (ou 'payload.data'), lower-case nas chaves.
+    Não mistura com topo para evitar 'name' do formulário.
+    """
+    base = original
+    if isinstance(original.get("payload"), dict):
+        base = original["payload"]
+    data = base.get("data") if isinstance(base.get("data"), dict) else {}
+    out = lower_keys(data)
+    # se houver subobjeto 'form' dentro de data, mescla (mantendo data como prioridade)
+    if isinstance(data.get("form"), dict):
+        form_lower = lower_keys(data["form"])
+        for k, v in form_lower.items():
+            out.setdefault(k, v)
+    return out
 
 # -------------------- BotConversa --------------------
 def bc_headers() -> Dict[str, str]:
-    return {
-        "accept": "application/json",
-        "Content-Type": "application/json",
-        "API-KEY": BOTCONVERSA_API_KEY,
-    }
+    return {"accept": "application/json", "Content-Type": "application/json", "API-KEY": BOTCONVERSA_API_KEY}
 
 def bc_create_or_update_subscriber(phone_digits: str, first_name: str, last_name: str) -> Optional[int]:
     url = f"{BOTCONVERSA_BASE_URL.rstrip('/')}/api/v1/webhook/subscriber/"
@@ -189,94 +139,111 @@ def bc_send_flow(subscriber_id: int, flow_id: int) -> bool:
         log("❌ BotConversa send_flow EXC", err=repr(e))
         return False
 
-# -------------------- DB Ops (sem psycopg2.sql) --------------------
-def upsert_member(conn, email: str, nome: str, phone_digits: str, extra_meta: Dict[str, Any]) -> int:
+# -------------------- DB introspection --------------------
+def table_columns(conn, table: str, schema: str = "public") -> Set[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT column_name FROM information_schema.columns
+               WHERE table_schema=%s AND table_name=%s""",
+            (schema, table),
+        )
+        return {r[0] for r in cur.fetchall()}
+
+def has_unique_on_email(conn, table: str = "membersnextlevel", schema: str = "public") -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1
+              FROM information_schema.table_constraints tc
+              JOIN information_schema.key_column_usage kcu
+                ON tc.constraint_name = kcu.constraint_name
+               AND tc.table_schema = kcu.table_schema
+             WHERE tc.table_schema = %s
+               AND tc.table_name   = %s
+               AND tc.constraint_type IN ('UNIQUE','PRIMARY KEY')
+               AND kcu.column_name = 'email'
+             LIMIT 1
+            """,
+            (schema, table),
+        )
+        return cur.fetchone() is not None
+
+# -------------------- DB ops (tolerantes) --------------------
+def upsert_member(conn, email: str, nome: str, phone_digits: str, raw_payload: Dict[str, Any]) -> int:
     cols = table_columns(conn, "membersnextlevel")
     has_created = "created_at" in cols
     has_updated = "updated_at" in cols
     has_metadata = "metadata" in cols
 
-    meta_json_str = json.dumps({"phone": phone_digits, **(extra_meta or {})}, ensure_ascii=False)
+    meta_obj = {"phone": phone_digits, "raw_payload": raw_payload}
+    meta_json = json.dumps(meta_obj, ensure_ascii=False)
 
-    # ON CONFLICT se houver unique em email
+    # Tenta ON CONFLICT se houver unique em email
     if has_unique_on_email(conn):
         insert_cols = ["email", "nome"]
-        insert_vals_placeholders = ["%s", "%s"]
-        bind_vals: List[Any] = [email, nome]
-
+        insert_vals = ["%s", "%s"]
+        bind = [email, nome]
         if has_metadata:
             insert_cols.append("metadata")
-            insert_vals_placeholders.append("%s::jsonb")
-            bind_vals.append(meta_json_str)
+            insert_vals.append("%s::jsonb")
+            bind.append(meta_json)
         if has_created:
             insert_cols.append("created_at")
-            insert_vals_placeholders.append("NOW()")
+            insert_vals.append("NOW()")
         if has_updated:
             insert_cols.append("updated_at")
-            insert_vals_placeholders.append("NOW()")
+            insert_vals.append("NOW()")
 
         set_parts = ["nome = EXCLUDED.nome"]
         if has_metadata:
-            set_parts.append("metadata = COALESCE(membersnextlevel.metadata, '{}'::jsonb) || EXCLUDED.metadata")
+            set_parts.append("metadata = COALESCE(membersnextlevel.metadata,'{}'::jsonb) || EXCLUDED.metadata")
         if has_updated:
             set_parts.append("updated_at = NOW()")
-        set_sql = ", ".join(set_parts)
 
-        sql = f"""
-            INSERT INTO membersnextlevel ({", ".join(insert_cols)})
-            VALUES ({", ".join(insert_vals_placeholders)})
-            ON CONFLICT (email) DO UPDATE
-               SET {set_sql}
-            RETURNING id
-        """
+        sql = f"""INSERT INTO membersnextlevel ({", ".join(insert_cols)})
+                  VALUES ({", ".join(insert_vals)})
+                  ON CONFLICT (email) DO UPDATE SET {", ".join(set_parts)}
+                  RETURNING id"""
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, bind_vals)
+            cur.execute(sql, bind)
             row = cur.fetchone()
             mid = int(row["id"])
             log("👤 UPSERT member", email=email, id=mid)
             return mid
 
-    # Fallback: SELECT/UPDATE/INSERT
+    # Fallback manual
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SELECT id FROM membersnextlevel WHERE email=%s LIMIT 1", (email,))
         row = cur.fetchone()
         if row:
             mid = int(row["id"])
             set_parts = ["nome=%s"]
-            bind_vals2: List[Any] = [nome]
-
+            bind2 = [nome]
             if has_metadata:
-                set_parts.append("metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb")
-                bind_vals2.append(meta_json_str)
+                set_parts.append("metadata = COALESCE(metadata,'{}'::jsonb) || %s::jsonb")
+                bind2.append(meta_json)
             if has_updated:
                 set_parts.append("updated_at = NOW()")
-
-            cur.execute(
-                f"UPDATE membersnextlevel SET {', '.join(set_parts)} WHERE id=%s",
-                (*bind_vals2, mid),
-            )
+            cur.execute(f"UPDATE membersnextlevel SET {', '.join(set_parts)} WHERE id=%s", (*bind2, mid))
             log("👤 UPDATE member", email=email, id=mid)
             return mid
 
-        # INSERT
         insert_cols = ["email", "nome"]
-        insert_vals_placeholders = ["%s", "%s"]
-        bind_vals3: List[Any] = [email, nome]
-
+        insert_vals = ["%s", "%s"]
+        bind3 = [email, nome]
         if has_metadata:
             insert_cols.append("metadata")
-            insert_vals_placeholders.append("%s::jsonb")
-            bind_vals3.append(meta_json_str)
+            insert_vals.append("%s::jsonb")
+            bind3.append(meta_json)
         if has_created:
             insert_cols.append("created_at")
-            insert_vals_placeholders.append("NOW()")
+            insert_vals.append("NOW()")
         if has_updated:
             insert_cols.append("updated_at")
-            insert_vals_placeholders.append("NOW()")
-
+            insert_vals.append("NOW()")
         cur.execute(
-            f"INSERT INTO membersnextlevel ({', '.join(insert_cols)}) VALUES ({', '.join(insert_vals_placeholders)}) RETURNING id",
-            bind_vals3,
+            f"INSERT INTO membersnextlevel ({', '.join(insert_cols)}) VALUES ({', '.join(insert_vals)}) RETURNING id",
+            bind3,
         )
         row = cur.fetchone()
         mid = int(row["id"])
@@ -285,80 +252,58 @@ def upsert_member(conn, email: str, nome: str, phone_digits: str, extra_meta: Di
 
 def save_botconversa_id(conn, member_id: int, subscriber_id: int):
     cols = table_columns(conn, "membersnextlevel")
-    has_metadata = "metadata" in cols
-    has_updated = "updated_at" in cols
-
-    if not has_metadata:
-        log("⚠️ Tabela membersnextlevel sem coluna 'metadata'; não foi possível salvar botconversa_id")
+    if "metadata" not in cols:
+        log("⚠️ membersnextlevel sem 'metadata'; não foi possível salvar botconversa_id")
         return
-
     set_parts = ["metadata = COALESCE(metadata,'{}'::jsonb) || %s::jsonb"]
-    bind_vals: List[Any] = [json.dumps({"botconversa_id": subscriber_id}, ensure_ascii=False)]
-    if has_updated:
+    bind = [json.dumps({"botconversa_id": subscriber_id}, ensure_ascii=False)]
+    if "updated_at" in cols:
         set_parts.append("updated_at = NOW()")
-
     with conn.cursor() as cur:
-        cur.execute(
-            f"UPDATE membersnextlevel SET {', '.join(set_parts)} WHERE id=%s",
-            (*bind_vals, member_id),
-        )
+        cur.execute(f"UPDATE membersnextlevel SET {', '.join(set_parts)} WHERE id=%s", (*bind, member_id))
 
 def enqueue_validation_job(conn, member_id: int, email: str, nome: str, fonte: str = "sbcp"):
     cols = table_columns(conn, "validations_jobs")
     insert_cols = ["member_id", "email", "nome"]
-    insert_vals_placeholders = ["%s", "%s", "%s"]
-    bind_vals: List[Any] = [member_id, email, nome]
-
+    insert_vals = ["%s", "%s", "%s"]
+    bind = [member_id, email, nome]
     if "fonte" in cols:
-        insert_cols.append("fonte")
-        insert_vals_placeholders.append("%s")
-        bind_vals.append(fonte)
+        insert_cols.append("fonte"); insert_vals.append("%s"); bind.append(fonte)
     if "status" in cols:
-        insert_cols.append("status")
-        insert_vals_placeholders.append("%s")
-        bind_vals.append("PENDING")
+        insert_cols.append("status"); insert_vals.append("%s"); bind.append("PENDING")
     if "attempts" in cols:
-        insert_cols.append("attempts")
-        insert_vals_placeholders.append("%s")
-        bind_vals.append(0)
+        insert_cols.append("attempts"); insert_vals.append("%s"); bind.append(0)
     if "created_at" in cols:
-        insert_cols.append("created_at")
-        insert_vals_placeholders.append("NOW()")
+        insert_cols.append("created_at"); insert_vals.append("NOW()")
     if "updated_at" in cols:
-        insert_cols.append("updated_at")
-        insert_vals_placeholders.append("NOW()")
-
+        insert_cols.append("updated_at"); insert_vals.append("NOW()")
     with conn.cursor() as cur:
-        cur.execute(
-            f"INSERT INTO validations_jobs ({', '.join(insert_cols)}) VALUES ({', '.join(insert_vals_placeholders)})",
-            bind_vals,
-        )
+        cur.execute(f"INSERT INTO validations_jobs ({', '.join(insert_cols)}) VALUES ({', '.join(insert_vals)})", bind)
     log("📥 Job enfileirado", member_id=member_id, email=email, fonte=fonte, status="PENDING")
 
-# -------------------- Payload parsing --------------------
-def parse_fields() -> Tuple[str, str, str, Dict[str, Any], Dict[str, Any]]:
+# -------------------- Parsing principal --------------------
+def parse_fields_from_payload() -> Tuple[str, str, str, Dict[str, Any], Dict[str, Any]]:
+    """
+    Retorna: (email, full_name, phone_digits, meta_extra, warns)
+    - Lê *apenas* de data/payload.data para evitar 'name' do topo (nome do formulário).
+    - Reconhece 'nome', 'email', 'celular' (e sinônimos).
+    - Salva raw_payload original no metadata.
+    """
     warns: Dict[str, Any] = {}
-    body = coalesce_payload()
+    original = extract_original_json()  # para salvar no metadata
+    flat = flatten_data_block(original) # campos realmente enviados no formulário
 
-    email = first_present(
-        body,
-        "email", "e-mail", "e_mail", "mail", "contato_email", "contact_email",
-    ) or ""
-
-    full_name = first_present(
-        body,
-        "name", "nome", "full_name", "fullname", "full name", "nome completo", "first and last name",
-    ) or ""
-
-    phone = first_present(
-        body,
-        "phone", "telefone", "tel", "whatsapp", "celular", "mobile", "contato_telefone", "contact_phone",
-    ) or ""
+    # campos (em lower-case)
+    email = first_present(flat, ["email", "e-mail", "e_mail", "mail"]) or ""
+    full_name = first_present(flat, ["nome", "full_name", "fullname", "full name"]) or ""
+    phone = first_present(flat, ["celular", "whatsapp", "phone", "telefone", "tel", "mobile"]) or ""
 
     phone_digits = normalize_phone_br(phone)
+
     if not full_name:
         full_name = "Visitante"
         warns["no_name"] = True
+
     if not email:
         if phone_digits:
             email = f"{phone_digits}@temp.nextlevelmedical.local"
@@ -366,10 +311,11 @@ def parse_fields() -> Tuple[str, str, str, Dict[str, Any], Dict[str, Any]]:
         else:
             email = f"lead-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}@temp.nextlevelmedical.local"
             warns["email_fallback"] = "timestamp"
+
     if not phone_digits and phone:
         warns["bad_phone_format"] = phone
 
-    meta_extra = {"raw_payload": body}
+    meta_extra = {"raw_payload": original}
     return email, full_name, phone_digits, meta_extra, warns
 
 # -------------------- Routes --------------------
@@ -385,13 +331,13 @@ def health():
 def webflow_webhook():
     conn = None
     try:
-        email, full_name, phone_digits, extra_meta, warns = parse_fields()
+        email, full_name, phone_digits, extra_meta, warns = parse_fields_from_payload()
         first_name, last_name = split_name(full_name)
 
         conn = db()
 
-        # 1) Upsert membro
-        member_id = upsert_member(conn, email=email, nome=full_name, phone_digits=phone_digits, extra_meta=extra_meta)
+        # 1) Upsert membro (salva raw_payload + phone)
+        member_id = upsert_member(conn, email=email, nome=full_name, phone_digits=phone_digits, raw_payload=extra_meta.get("raw_payload", {}))
 
         # 2) BotConversa: cria/atualiza subscriber e salva id
         subscriber_id = None
@@ -413,31 +359,21 @@ def webflow_webhook():
         # 4) Enfileira validação
         enqueue_validation_job(conn, member_id=member_id, email=email, nome=full_name, fonte="sbcp")
 
-        resp = {
-            "ok": True,
-            "member_id": member_id,
-            "subscriber_id": subscriber_id,
-            "flow_id": BOTCONVERSA_FLOW_ANALISE if subscriber_id else None,
-        }
+        resp = {"ok": True, "member_id": member_id, "subscriber_id": subscriber_id, "flow_id": BOTCONVERSA_FLOW_ANALISE if subscriber_id else None}
         if warns:
             resp["warn"] = warns
         return jsonify(resp), 200
 
     except Exception as e:
         if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+            try: conn.rollback()
+            except Exception: pass
         log("💥 webhook_error", err=repr(e))
         return jsonify({"ok": False, "error": str(e)}), 500
     finally:
         if conn:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            try: conn.close()
+            except Exception: pass
 
-# -------------------- Main (local) --------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=SERVICE_PORT)

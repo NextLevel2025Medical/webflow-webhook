@@ -5,12 +5,13 @@ Scraper da SBCP (cirurgiaplastica.org.br) usando Playwright (API síncrona).
 Principais funções públicas:
 - buscar_sbcp(member_id, nome, email, steps): executa a busca pelo nome e tenta abrir o 1º perfil; extrai todos os
   campos exibidos no perfil em pares <dt>/<dd> dentro de ".cirurgiao-info" e normaliza CRM/RQE/CREFITO.
-- (opcionais) log_validation(...) e set_member_validation(...) para registrar no banco, se desejar.
 
 Melhorias implementadas:
 1) [PATCH 1] Espera explícita do container correto de perfil (".cirurgiao-info") após abrir o 1º resultado.
 2) [PATCH 2] Extração via leitura de pares <dt>/<dd> dentro de ".cirurgiao-info"; só depois aplica normalização
    para gerar crm_padrao, rqe_padrao, crefito_padrao (ex.: "32019" ou "32019-BA"), preservando arrays de múltiplos.
+3) [PATCH 3] Ao invés de clicar no resultado, captura o href do link de perfil ("/cirurgiao/") e usa page.goto(href),
+   evitando clicar em links de menu como "/encontre-um-cirurgiao/".
 
 Extras:
 - Busca tolerante (múltiplos seletores e timeouts razoáveis).
@@ -22,8 +23,9 @@ import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin
 
-# Banco (opcional, usado só se for chamar log_validation/set_member_validation)
+# Banco (opcional, mantido aqui só para quem quiser aproveitar)
 try:
     import psycopg2
     import psycopg2.extras
@@ -139,7 +141,6 @@ def _ensure_playwright_browsers(steps: List[str]) -> None:
     """
     try:
         steps.append("try_playwright_install_check")
-        # tentativa leve: abrir playwright; se falhar, instalar
         with sync_playwright() as p:
             _ = p.chromium
         steps.append("playwright_ok")
@@ -220,7 +221,6 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
         v_raw = dd_texts[i]
         k = _strip_accents_lower(k_raw)
         raw_map[k] = v_raw
-        # também guardar as chaves brutas para auditoria opcional
         dados.setdefault("_raw_pairs", []).append({"k": k_raw, "v": v_raw})
 
     # Aliases possíveis no site
@@ -283,21 +283,21 @@ def _extract_profile(page, steps: List[str]) -> Dict[str, Any]:
 
 
 # =========================
-# BUSCA e navegação (inclui PATCH 1)
+# BUSCA e navegação (inclui PATCH 1 e PATCH 3)
 # =========================
 def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None, steps: Optional[List[str]] = None) -> Dict[str, Any]:
     """
-    Abre a página de busca, pesquisa pelo nome, clica no 1º resultado e extrai o perfil.
+    Abre a página de busca, pesquisa pelo nome, abre o 1º perfil por navegação via href e extrai o perfil.
     Retorno:
       {
         "ok": bool,
-        "qtd": int,                # quantidade de resultados (se detectável)
-        "resultados": list,        # opcional, se implementar varredura múltipla
-        "dados": dict,             # dicionário com campos do perfil (nome, crm, rqe, etc.)
-        "steps": list[str],        # trilha de auditoria
+        "qtd": int,
+        "resultados": list,
+        "dados": dict,
+        "steps": list[str],
         "nome_busca": str,
         "timing_ms": int,
-        "reason": "motivo"         # se ok=False
+        "reason": "motivo"   # se ok=False
       }
     """
     if steps is None:
@@ -323,7 +323,7 @@ def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None
             browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             context = browser.new_context(ignore_https_errors=True, java_script_enabled=True)
             page = context.new_page()
-            page.set_default_timeout(25000)
+            page.set_default_timeout(30000)
 
             # 1) Abre página
             steps.append("launch chromium")
@@ -377,20 +377,22 @@ def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None
                     "reason": "falha_submit",
                 }
 
-            # 4) Espera resultados aparecerem (lista/carta)
-            lista_selectors = [
-                ".cirurgiao-lista a",
-                ".cirurgiao-card a",
-                "a:has-text('Ver perfil')",
-                ".resultado a",
-                ".resultados a",
-                ".busca-cirurgiao a",
-                "a[href*='cirurgiao']",
-            ]
+            # 4) Espera por links REAIS de perfil (evita clicar no menu do topo)
+            perfil_link_sel = "a[href*='/cirurgiao/']:not([href*='encontre-um-cirurgiao'])"
             try:
-                # Espera pelo menos um resultado
-                primeiro_link = _try_select(page, lista_selectors, timeout=25000, steps=steps)
-                steps.append("resultado_apareceu:lista")
+                page.wait_for_selector(perfil_link_sel, timeout=30000)
+                links_loc = page.locator(perfil_link_sel)
+                n_links = links_loc.count()
+                steps.append(f"resultado_apareceu:links_perfil={n_links}")
+
+                # DEBUG: registra até 5 hrefs para auditoria
+                hrefs = []
+                for i in range(min(n_links, 5)):
+                    try:
+                        hrefs.append(links_loc.nth(i).get_attribute("href") or "")
+                    except Exception:
+                        hrefs.append("")
+                steps.append(f"hrefs_top={hrefs}")
             except PWTimeout:
                 steps.append("sem_resultados_ou_layout_alterado")
                 return {
@@ -403,12 +405,32 @@ def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None
                     "reason": "sem_resultados_ou_layout_alterado",
                 }
 
-            # 5) Abre o 1º perfil
+            # (opcional) tentar priorizar um link que contenha parte do nome
             try:
-                primeiro_link.click(timeout=12000)
-                steps.append("abriu_perfil_primeiro_resultado")
+                pedaco = nome_busca.split()[0]
+                candidato = page.locator(f"{perfil_link_sel}:has-text('{pedaco}')")
+                if candidato.count() > 0:
+                    links_loc = candidato
+            except Exception:
+                pass
+
+            # 5) Abre o 1º perfil por navegação direta (mais robusto que click)
+            try:
+                alvo = links_loc.nth(0)
+                href = (alvo.get_attribute("href") or "").strip()
+                if href:
+                    if not href.lower().startswith("http"):
+                        href = urljoin(BASE_URL, href)
+                    steps.append(f"abrindo_href={href}")
+                    page.goto(href, wait_until="domcontentloaded", timeout=45000)
+                    steps.append("abriu_perfil_primeiro_resultado:goto")
+                else:
+                    # fallback: forçar clique com scroll, se por algum motivo não houver href
+                    alvo.scroll_into_view_if_needed(timeout=5000)
+                    alvo.click(force=True, timeout=15000)
+                    steps.append("abriu_perfil_primeiro_resultado:click")
             except Exception as e:
-                steps.append(f"erro_click_primeiro_resultado:{e}")
+                steps.append(f"erro_abrir_perfil:{e}")
                 return {
                     "ok": False,
                     "qtd": 0,
@@ -444,7 +466,7 @@ def buscar_sbcp(member_id: Optional[int], nome: str, email: Optional[str] = None
             return {
                 "ok": bool(dados),
                 "qtd": qtd_detectada,
-                "resultados": [],         # se quiser futuramente, pode coletar vários
+                "resultados": [],
                 "dados": dados,
                 "steps": steps,
                 "nome_busca": nome_busca,

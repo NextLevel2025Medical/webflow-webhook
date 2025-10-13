@@ -38,7 +38,7 @@ FLOW_PENDENTE        = int(os.getenv("BOTCONVERSA_FLOW_PENDENTE", "7479965"))
 # Cademi
 CADEMI_URL          = os.getenv("CADEMI_URL", "https://nextlevelmedical.cademi.com.br/api/postback/custom")
 CADEMI_AUTH         = os.getenv("CADEMI_AUTH", "e633cefa-b72a-4214-a56f-fd71a39576dd")
-CADEMI_PRODUTO_ID   = os.getenv("CADEMI_PRODUTO_ID", "1750698012")
+CADEMI_PRODUTO_ID   = os.getenv("CADEMI_PRODUTO_ID", "plastic-transicao")
 CADEMI_TOKEN        = os.getenv("CADEMI_TOKEN", "6e88c3b468378317d758f5f1c09cd2ec")
 CADEMI_CODIGO_PREF  = os.getenv("CADEMI_CODIGO_PREFIX", "LiberacaoIA")  # use 'LiberaçãoIA' se preferir com acento
 
@@ -469,3 +469,4 @@ def work_loop():
 
 if __name__ == "__main__":
     work_loop()
+

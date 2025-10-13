@@ -1,19 +1,26 @@
 # -*- coding: utf-8 -*-
 """
 Worker de validação:
-- TTL (tempo máximo) por job: 2 minutos (configurável por TTL_SECONDS)
-  * Re-enfileira RUNNING antigos (watchdog)
-  * Se a execução passar de TTL, encerra por timeout (re-enfileira até MAX_ATTEMPTS; depois FAILED)
-- Ao aprovar:
-  * Envia flow aprovado no BotConversa
-  * POST na Cademi para liberar conteúdo (codigo = <prefix> + job_id, email do membro)
-- Escreve validations_log em toda finalização (se a tabela existir)
+- TTL por job: 2 minutos (TTL_SECONDS=120)
+- Re-enfileira RUNNING antigos (watchdog)
+- No último erro (FAILED definitivo):
+    * Envia flow pendente (7479965) SEM supressão por sucesso prévio
+    * Grava em validations_log (se existir)
+    * Chama Cademi em caso de aprovado (vide abaixo)
+
+Integrações:
+- BotConversa (flows aprov/pende)
+- Cademi postback para liberacao (produto_id="plastic-transicao")
 
 Env:
   DATABASE_URL
   BOTCONVERSA_API_KEY, BOTCONVERSA_BASE_URL
   BOTCONVERSA_FLOW_APROVADO=7479824, BOTCONVERSA_FLOW_PENDENTE=7479965
-  CADEMI_URL, CADEMI_AUTH, CADEMI_PRODUTO_ID, CADEMI_TOKEN, CADEMI_CODIGO_PREFIX=LiberacaoIA
+  CADEMI_URL=https://nextlevelmedical.cademi.com.br/api/postback/custom
+  CADEMI_AUTH=e633cefa-b72a-4214-a56f-fd71a39576dd
+  CADEMI_PRODUTO_ID=plastic-transicao
+  CADEMI_TOKEN=6e88c3b468378317d758f5f1c09cd2ec
+  CADEMI_CODIGO_PREFIX=LiberacaoIA
   TTL_SECONDS=120, MAX_ATTEMPTS=3, POLL_SECONDS=3
 """
 import os, re, time, json
@@ -38,9 +45,10 @@ FLOW_PENDENTE        = int(os.getenv("BOTCONVERSA_FLOW_PENDENTE", "7479965"))
 # Cademi
 CADEMI_URL          = os.getenv("CADEMI_URL", "https://nextlevelmedical.cademi.com.br/api/postback/custom")
 CADEMI_AUTH         = os.getenv("CADEMI_AUTH", "e633cefa-b72a-4214-a56f-fd71a39576dd")
+# >>> ALTERADO: produto_id padrão agora é "plastic-transicao"
 CADEMI_PRODUTO_ID   = os.getenv("CADEMI_PRODUTO_ID", "plastic-transicao")
 CADEMI_TOKEN        = os.getenv("CADEMI_TOKEN", "6e88c3b468378317d758f5f1c09cd2ec")
-CADEMI_CODIGO_PREF  = os.getenv("CADEMI_CODIGO_PREFIX", "LiberacaoIA")  # use 'LiberaçãoIA' se preferir com acento
+CADEMI_CODIGO_PREF  = os.getenv("CADEMI_CODIGO_PREFIX", "LiberacaoIA")
 
 def log(*args, **kwargs):
     msg = " ".join(str(a) for a in args)
@@ -53,7 +61,8 @@ def db():
 
 def table_columns(conn, table: str, schema: str = "public") -> Set[str]:
     with conn.cursor() as cur:
-        cur.execute("""SELECT column_name FROM information_schema.columns WHERE table_schema=%s AND table_name=%s""", (schema, table))
+        cur.execute("""SELECT column_name FROM information_schema.columns WHERE table_schema=%s AND table_name=%s""",
+                    (schema, table))
         return {r[0] for r in cur.fetchall()}
 
 def get_tables(conn) -> Set[str]:
@@ -96,7 +105,6 @@ def finalize_job(conn, job_id: int, status: str, last_error: Optional[str]) -> N
         cur.execute(f"UPDATE validations_jobs SET {', '.join(sets)} WHERE id=%s", (*bind, job_id))
 
 def requeue_stale_running_jobs(conn, ttl_seconds: int) -> int:
-    """Re-enfileira RUNNING muito antigos (watchdog)."""
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -146,12 +154,30 @@ def update_member_after_result(conn, member_id: int, fonte: str, result: Dict[st
 
 # ---------- logs ----------
 def insert_validation_log(conn, member_id: int, fonte: str, status_txt: str, payload: Dict[str, Any]):
-    if "validations_log" not in get_tables(conn): return
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO validations_log (member_id, fonte, status, payload, created_at) VALUES (%s,%s,%s,%s::jsonb,NOW())",
-            (member_id, fonte, status_txt, json.dumps({"raw": payload}, ensure_ascii=False)),
-        )
+    if "validations_log" not in get_tables(conn):
+        log("ℹ️ validations_log ausente; sem persistência de log.")
+        return
+    cols = table_columns(conn, "validations_log")
+    try:
+        with conn.cursor() as cur:
+            if {"member_id","fonte","status","payload","created_at"} <= cols:
+                cur.execute(
+                    "INSERT INTO validations_log (member_id, fonte, status, payload, created_at) VALUES (%s,%s,%s,%s::jsonb,NOW())",
+                    (member_id, fonte, status_txt, json.dumps({"raw": payload}, ensure_ascii=False)),
+                )
+            elif {"member_id","status","payload"} <= cols:
+                cur.execute(
+                    "INSERT INTO validations_log (member_id, status, payload) VALUES (%s,%s,%s::jsonb)",
+                    (member_id, status_txt, json.dumps({"raw": payload}, ensure_ascii=False)),
+                )
+            else:
+                # fallback minimal
+                cur.execute(
+                    "INSERT INTO validations_log (payload) VALUES (%s::jsonb)",
+                    (json.dumps({"member_id": member_id, "fonte": fonte, "status": status_txt, "raw": payload}, ensure_ascii=False),)
+                )
+    except Exception as e:
+        log("❌ validations_log insert FAIL", err=repr(e))
 
 # ---------- documento helpers ----------
 def only_digits(s: Optional[str]) -> str:
@@ -277,40 +303,6 @@ def save_member_botconversa_id(conn, member_id: int, subscriber_id: int) -> None
     with conn.cursor() as cur:
         cur.execute(f"UPDATE membersnextlevel SET {', '.join(sets)} WHERE id=%s", (*bind, member_id))
 
-# ---------- coordenação por telefone ----------
-def cancel_other_jobs_for_phone(conn, phone: str, exclude_job_id: int) -> int:
-    if not phone: return 0
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE validations_jobs j
-               SET status='CANCELLED', last_error='cancelled_by_other_success', updated_at=NOW()
-              FROM membersnextlevel m
-             WHERE j.member_id = m.id
-               AND m.metadata->>'phone' = %s
-               AND j.id <> %s
-               AND j.status IN ('PENDING','RUNNING')
-            """,
-            (phone, exclude_job_id),
-        )
-        return cur.rowcount or 0
-
-def exists_succeeded_for_phone(conn, phone: str) -> bool:
-    if not phone: return False
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT 1
-              FROM validations_jobs j
-              JOIN membersnextlevel m ON m.id = j.member_id
-             WHERE m.metadata->>'phone' = %s
-               AND j.status = 'SUCCEEDED'
-             LIMIT 1
-            """,
-            (phone,),
-        )
-        return cur.fetchone() is not None
-
 # ---------- Cademi ----------
 def cademi_headers() -> Dict[str, str]:
     return {"Authorization": CADEMI_AUTH, "Content-Type": "application/json"}
@@ -319,7 +311,7 @@ def cademi_postback(job_id: int, cliente_email: str) -> bool:
     payload = {
         "codigo": f"{CADEMI_CODIGO_PREF}{job_id}",
         "status": "aprovado",
-        "produto_id": str(CADEMI_PRODUTO_ID),
+        "produto_id": str(CADEMI_PRODUTO_ID),  # pode ser string ou numérico. Aqui é "plastic-transicao".
         "cliente_email": cliente_email,
         "token": CADEMI_TOKEN,
     }
@@ -341,7 +333,7 @@ def work_loop():
 
     while True:
         try:
-            # watchdog: limpa RUNNING antigos
+            # watchdog: re-enfileira RUNNING antigos
             stale = requeue_stale_running_jobs(conn, TTL_SECONDS)
             if stale:
                 log(f"⏱️  Watchdog re-enfileirou {stale} job(s) RUNNING > {TTL_SECONDS}s")
@@ -411,7 +403,7 @@ def work_loop():
             elapsed = time.monotonic() - start
             timed_out = elapsed > TTL_SECONDS
 
-            # Atualiza o "banco principal"
+            # Atualiza membro
             try:
                 update_member_after_result(conn, member_id, fonte, result, expected_doc)
             except Exception as e:
@@ -420,16 +412,12 @@ def work_loop():
             # Finalização + fluxos + Cademi + logs
             with conn:
                 member = get_member_core(conn, member_id) or {"id": member_id, "nome": nome, "metadata": {}}
-                phone  = get_phone_by_member(conn, member_id)
+                # phone = get_phone_by_member(conn, member_id)  # pode não ser necessário aqui
 
                 if (result.get("ok") and not timed_out):
                     finalize_job(conn, job_id, "SUCCEEDED", None)
                     insert_validation_log(conn, member_id, fonte, "ok", result)
                     log(f"✅ Job {job_id} -> SUCCEEDED (membro {member_id}: aprovado)")
-
-                    # Cancela outros jobs do mesmo telefone
-                    cancelled = cancel_other_jobs_for_phone(conn, phone, job_id)
-                    if cancelled: log(f"🧹 Cancelados {cancelled} job(s) antigos para phone={phone}")
 
                     # Flow aprovado
                     sid = ensure_subscriber_id(conn, member)
@@ -443,7 +431,7 @@ def work_loop():
                         log("⚠️ Cademi: e-mail vazio; liberação não enviada.")
 
                 else:
-                    # timeout tem prioridade de mensagem
+                    # timeout indica reprocessamento até MAX_ATTEMPTS; no último, marca FAILED
                     if timed_out:
                         last_error = (last_error or "") + ("; " if last_error else "") + "timeout_ttl"
                         status_log = "timeout_ttl"
@@ -453,15 +441,18 @@ def work_loop():
                         insert_validation_log(conn, member_id, fonte, status_log or "retry", result or {"elapsed": elapsed})
                         log(f"🔁 Job {job_id} re-enfileirado (retry). status_log={status_log}")
                     else:
+                        # FAILED definitivo: envia flow pendente SEM supressão
                         finalize_job(conn, job_id, "FAILED", last_error or status_log or "erro_definitivo")
                         insert_validation_log(conn, member_id, fonte, status_log or "failed", result or {"elapsed": elapsed})
                         log(f"🧯 Job {job_id} -> FAILED definitivo. status_log={status_log}")
-                        if not exists_succeeded_for_phone(conn, phone):
-                            sid = ensure_subscriber_id(conn, member)
-                            if sid: bc_send_flow(sid, FLOW_PENDENTE)
-                            else: log("⚠️ BotConversa: subscriber_id ausente; não foi possível enviar flow pendente.")
+                        sid = ensure_subscriber_id(conn, member)
+                        if sid:
+                            sent = bc_send_flow(sid, FLOW_PENDENTE)
+                            insert_validation_log(conn, member_id, fonte, "flow_pendente_enviado" if sent else "flow_pendente_falhou",
+                                                  {"job_id": job_id, "subscriber_id": sid})
                         else:
-                            log(f"🚫 Pendente suprimido: já existe SUCCEEDED para phone={phone}")
+                            log("⚠️ BotConversa: subscriber_id ausente; não foi possível enviar flow pendente.")
+                            insert_validation_log(conn, member_id, fonte, "flow_pendente_nao_enviado", {"motivo": "subscriber_ausente", "job_id": job_id})
 
         except Exception as outer:
             log(f"💥 Loop erro: {outer}")
@@ -469,4 +460,3 @@ def work_loop():
 
 if __name__ == "__main__":
     work_loop()
-

@@ -2,18 +2,18 @@
 """
 Webhook (Webflow -> NextLevel) robusto e tolerante, com integração BotConversa.
 
-Correções: compatível com bancos que NÃO possuem created_at/updated_at.
-- Detecta colunas reais via information_schema e monta SQL dinamicamente.
-- Mantém integração BotConversa: cria/atualiza subscriber e dispara flow "em análise" AO RECEBER o cadastro.
-- Enfileira job em validations_jobs com segurança (colunas opcionais).
+- Envia o FLOW "em análise" no cadastro (default: 7479821; override via BOTCONVERSA_FLOW_ANALISE).
+- Tolerante a payloads (JSON e form), nome/email/telefone ausentes.
+- Compatível com schemas SEM created_at/updated_at/metadata.
+- NÃO usa psycopg2.sql (evita AttributeError).
 
-Variáveis de ambiente (com defaults seguros):
+Env:
 - DATABASE_URL
-- BOTCONVERSA_API_KEY          (default: chave fornecida)
-- BOTCONVERSA_BASE_URL         (default: https://backend.botconversa.com.br)
-- BOTCONVERSA_FLOW_ANALISE     (default: 7479821)
-- DEFAULT_COUNTRY_ISO          (default: BR)
-- PORT / SERVICE_PORT          (default: 10000)
+- BOTCONVERSA_API_KEY        (default: 362e173a-ba27-4655-9191-b4fd735394da)
+- BOTCONVERSA_BASE_URL       (default: https://backend.botconversa.com.br)
+- BOTCONVERSA_FLOW_ANALISE   (default: 7479821)
+- DEFAULT_COUNTRY_ISO        (default: BR)
+- PORT / SERVICE_PORT        (default: 10000)
 """
 
 import os
@@ -32,7 +32,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 BOTCONVERSA_API_KEY = os.getenv(
     "BOTCONVERSA_API_KEY",
-    "362e173a-ba27-4655-9191-b4fd735394da"  # ideal: mover para env no Render
+    "362e173a-ba27-4655-9191-b4fd735394da"
 )
 BOTCONVERSA_BASE_URL = os.getenv("BOTCONVERSA_BASE_URL", "https://backend.botconversa.com.br")
 BOTCONVERSA_FLOW_ANALISE = int(os.getenv("BOTCONVERSA_FLOW_ANALISE", "7479821"))
@@ -41,7 +41,6 @@ DEFAULT_COUNTRY_ISO = os.getenv("DEFAULT_COUNTRY_ISO", "BR").upper().strip()
 SERVICE_PORT = int(os.getenv("PORT", os.getenv("SERVICE_PORT", "10000")))
 
 app = Flask(__name__)
-
 
 # -------------------- Utils --------------------
 def log(*args, **kwargs):
@@ -105,7 +104,7 @@ def coalesce_payload() -> Dict[str, Any]:
         for k in request.args:
             base.setdefault(k, request.args.get(k))
 
-    # Camada "data" / "form" comuns em Webflow/Zapier
+    # Camada "data" / "form" frequente em Webflow/Zapier
     if isinstance(base.get("data"), dict):
         data = base["data"].copy()
         if isinstance(data.get("form"), dict):
@@ -118,7 +117,6 @@ def coalesce_payload() -> Dict[str, Any]:
         return lower_keys(base["payload"])
 
     return lower_keys(base)
-
 
 # -------------------- DB Introspection --------------------
 def table_columns(conn, table: str, schema: str = "public") -> Set[str]:
@@ -135,9 +133,6 @@ def table_columns(conn, table: str, schema: str = "public") -> Set[str]:
         return {r[0] for r in cur.fetchall()}
 
 def has_unique_on_email(conn, table: str = "membersnextlevel", schema: str = "public") -> bool:
-    """
-    Tenta detectar se existe uma restrição/índice único envolvendo a coluna 'email'.
-    """
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -155,7 +150,6 @@ def has_unique_on_email(conn, table: str = "membersnextlevel", schema: str = "pu
             (schema, table),
         )
         return cur.fetchone() is not None
-
 
 # -------------------- BotConversa --------------------
 def bc_headers() -> Dict[str, str]:
@@ -195,45 +189,31 @@ def bc_send_flow(subscriber_id: int, flow_id: int) -> bool:
         log("❌ BotConversa send_flow EXC", err=repr(e))
         return False
 
-
-# -------------------- DB Ops (dinâmicos) --------------------
+# -------------------- DB Ops (sem psycopg2.sql) --------------------
 def upsert_member(conn, email: str, nome: str, phone_digits: str, extra_meta: Dict[str, Any]) -> int:
     cols = table_columns(conn, "membersnextlevel")
     has_created = "created_at" in cols
     has_updated = "updated_at" in cols
     has_metadata = "metadata" in cols
 
-    metadata_json = json.dumps({"phone": phone_digits, **(extra_meta or {})}, ensure_ascii=False)
+    meta_json_str = json.dumps({"phone": phone_digits, **(extra_meta or {})}, ensure_ascii=False)
 
-    # Tenta ON CONFLICT se houver unique/PK em email
+    # ON CONFLICT se houver unique em email
     if has_unique_on_email(conn):
-        columns = ["email", "nome"]
-        values = [email, nome]
+        insert_cols = ["email", "nome"]
+        insert_vals_placeholders = ["%s", "%s"]
+        bind_vals: List[Any] = [email, nome]
+
         if has_metadata:
-            columns.append("metadata")
-            values.append(psycopg2.extras.Json(json.loads(metadata_json)))
+            insert_cols.append("metadata")
+            insert_vals_placeholders.append("%s::jsonb")
+            bind_vals.append(meta_json_str)
         if has_created:
-            columns.append("created_at")
-            values.append(psycopg2.sql.SQL("NOW()"))
+            insert_cols.append("created_at")
+            insert_vals_placeholders.append("NOW()")
         if has_updated:
-            columns.append("updated_at")
-            values.append(psycopg2.sql.SQL("NOW()"))
-
-        # Monta placeholders e SQL
-        insert_cols_sql = ", ".join(columns)
-        placeholders = ", ".join(["%s"] * len([v for v in values if not isinstance(v, psycopg2.sql.SQL)]))
-
-        # Precisamos injetar NOW() sem placeholder
-        real_values: List[Any] = []
-        compiled_cols: List[str] = []
-        compiled_vals: List[str] = []
-        for c, v in zip(columns, values):
-            compiled_cols.append(c)
-            if isinstance(v, psycopg2.sql.SQL):
-                compiled_vals.append("NOW()")
-            else:
-                compiled_vals.append("%s")
-                real_values.append(v)
+            insert_cols.append("updated_at")
+            insert_vals_placeholders.append("NOW()")
 
         set_parts = ["nome = EXCLUDED.nome"]
         if has_metadata:
@@ -243,68 +223,60 @@ def upsert_member(conn, email: str, nome: str, phone_digits: str, extra_meta: Di
         set_sql = ", ".join(set_parts)
 
         sql = f"""
-            INSERT INTO membersnextlevel ({", ".join(compiled_cols)})
-            VALUES ({", ".join(compiled_vals)})
+            INSERT INTO membersnextlevel ({", ".join(insert_cols)})
+            VALUES ({", ".join(insert_vals_placeholders)})
             ON CONFLICT (email) DO UPDATE
                SET {set_sql}
             RETURNING id
         """
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, real_values)
+            cur.execute(sql, bind_vals)
             row = cur.fetchone()
             mid = int(row["id"])
             log("👤 UPSERT member", email=email, id=mid)
             return mid
 
-    # Fallback: SELECT/UPDATE/INSERT manual
+    # Fallback: SELECT/UPDATE/INSERT
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SELECT id FROM membersnextlevel WHERE email=%s LIMIT 1", (email,))
         row = cur.fetchone()
         if row:
             mid = int(row["id"])
             set_parts = ["nome=%s"]
-            vals: List[Any] = [nome]
+            bind_vals2: List[Any] = [nome]
 
             if has_metadata:
                 set_parts.append("metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb")
-                vals.append(metadata_json)
+                bind_vals2.append(meta_json_str)
             if has_updated:
                 set_parts.append("updated_at = NOW()")
 
             cur.execute(
                 f"UPDATE membersnextlevel SET {', '.join(set_parts)} WHERE id=%s",
-                (*vals, mid),
+                (*bind_vals2, mid),
             )
             log("👤 UPDATE member", email=email, id=mid)
             return mid
 
         # INSERT
-        columns = ["email", "nome"]
-        values = [email, nome]
-        if has_metadata:
-            columns.append("metadata")
-            values.append(metadata_json)
-        if has_created:
-            columns.append("created_at")
-            values.append(psycopg2.sql.SQL("NOW()"))
-        if has_updated:
-            columns.append("updated_at")
-            values.append(psycopg2.sql.SQL("NOW()"))
+        insert_cols = ["email", "nome"]
+        insert_vals_placeholders = ["%s", "%s"]
+        bind_vals3: List[Any] = [email, nome]
 
-        compiled_cols: List[str] = []
-        compiled_vals: List[str] = []
-        real_values2: List[Any] = []
-        for c, v in zip(columns, values):
-            compiled_cols.append(c)
-            if isinstance(v, psycopg2.sql.SQL):
-                compiled_vals.append("NOW()")
-            else:
-                compiled_vals.append("%s")
-                real_values2.append(v)
+        if has_metadata:
+            insert_cols.append("metadata")
+            insert_vals_placeholders.append("%s::jsonb")
+            bind_vals3.append(meta_json_str)
+        if has_created:
+            insert_cols.append("created_at")
+            insert_vals_placeholders.append("NOW()")
+        if has_updated:
+            insert_cols.append("updated_at")
+            insert_vals_placeholders.append("NOW()")
 
         cur.execute(
-            f"INSERT INTO membersnextlevel ({', '.join(compiled_cols)}) VALUES ({', '.join(compiled_vals)}) RETURNING id",
-            real_values2,
+            f"INSERT INTO membersnextlevel ({', '.join(insert_cols)}) VALUES ({', '.join(insert_vals_placeholders)}) RETURNING id",
+            bind_vals3,
         )
         row = cur.fetchone()
         mid = int(row["id"])
@@ -316,63 +288,52 @@ def save_botconversa_id(conn, member_id: int, subscriber_id: int):
     has_metadata = "metadata" in cols
     has_updated = "updated_at" in cols
 
+    if not has_metadata:
+        log("⚠️ Tabela membersnextlevel sem coluna 'metadata'; não foi possível salvar botconversa_id")
+        return
+
+    set_parts = ["metadata = COALESCE(metadata,'{}'::jsonb) || %s::jsonb"]
+    bind_vals: List[Any] = [json.dumps({"botconversa_id": subscriber_id}, ensure_ascii=False)]
+    if has_updated:
+        set_parts.append("updated_at = NOW()")
+
     with conn.cursor() as cur:
-        if has_metadata:
-            set_parts = ["metadata = COALESCE(metadata,'{}'::jsonb) || %s::jsonb"]
-            vals: List[Any] = [json.dumps({"botconversa_id": subscriber_id}, ensure_ascii=False)]
-        else:
-            # se não houver metadata, cria uma coluna simples? (não recomendado)
-            # fallback: não salva nada além de log
-            log("⚠️ Tabela membersnextlevel sem coluna 'metadata'; não foi possível salvar botconversa_id")
-            return
-
-        if has_updated:
-            set_parts.append("updated_at = NOW()")
-
         cur.execute(
             f"UPDATE membersnextlevel SET {', '.join(set_parts)} WHERE id=%s",
-            (*vals, member_id),
+            (*bind_vals, member_id),
         )
 
 def enqueue_validation_job(conn, member_id: int, email: str, nome: str, fonte: str = "sbcp"):
     cols = table_columns(conn, "validations_jobs")
-    columns = ["member_id", "email", "nome"]
-    values: List[Any] = [member_id, email, nome]
+    insert_cols = ["member_id", "email", "nome"]
+    insert_vals_placeholders = ["%s", "%s", "%s"]
+    bind_vals: List[Any] = [member_id, email, nome]
 
     if "fonte" in cols:
-        columns.append("fonte")
-        values.append(fonte)
+        insert_cols.append("fonte")
+        insert_vals_placeholders.append("%s")
+        bind_vals.append(fonte)
     if "status" in cols:
-        columns.append("status")
-        values.append("PENDING")
+        insert_cols.append("status")
+        insert_vals_placeholders.append("%s")
+        bind_vals.append("PENDING")
     if "attempts" in cols:
-        columns.append("attempts")
-        values.append(0)
+        insert_cols.append("attempts")
+        insert_vals_placeholders.append("%s")
+        bind_vals.append(0)
     if "created_at" in cols:
-        columns.append("created_at")
-        values.append(psycopg2.sql.SQL("NOW()"))
+        insert_cols.append("created_at")
+        insert_vals_placeholders.append("NOW()")
     if "updated_at" in cols:
-        columns.append("updated_at")
-        values.append(psycopg2.sql.SQL("NOW()"))
-
-    compiled_cols: List[str] = []
-    compiled_vals: List[str] = []
-    real_vals: List[Any] = []
-    for c, v in zip(columns, values):
-        compiled_cols.append(c)
-        if isinstance(v, psycopg2.sql.SQL):
-            compiled_vals.append("NOW()")
-        else:
-            compiled_vals.append("%s")
-            real_vals.append(v)
+        insert_cols.append("updated_at")
+        insert_vals_placeholders.append("NOW()")
 
     with conn.cursor() as cur:
         cur.execute(
-            f"INSERT INTO validations_jobs ({', '.join(compiled_cols)}) VALUES ({', '.join(compiled_vals)})",
-            real_vals,
+            f"INSERT INTO validations_jobs ({', '.join(insert_cols)}) VALUES ({', '.join(insert_vals_placeholders)})",
+            bind_vals,
         )
     log("📥 Job enfileirado", member_id=member_id, email=email, fonte=fonte, status="PENDING")
-
 
 # -------------------- Payload parsing --------------------
 def parse_fields() -> Tuple[str, str, str, Dict[str, Any], Dict[str, Any]]:
@@ -411,7 +372,6 @@ def parse_fields() -> Tuple[str, str, str, Dict[str, Any], Dict[str, Any]]:
     meta_extra = {"raw_payload": body}
     return email, full_name, phone_digits, meta_extra, warns
 
-
 # -------------------- Routes --------------------
 @app.get("/")
 def index():
@@ -430,7 +390,7 @@ def webflow_webhook():
 
         conn = db()
 
-        # 1) Upsert membro (sem depender de created_at/updated_at)
+        # 1) Upsert membro
         member_id = upsert_member(conn, email=email, nome=full_name, phone_digits=phone_digits, extra_meta=extra_meta)
 
         # 2) BotConversa: cria/atualiza subscriber e salva id
@@ -445,11 +405,10 @@ def webflow_webhook():
         else:
             log("⚠️ Sem telefone normalizado; pulando BotConversa")
 
-        # 3) Envia FLOW “em análise”, se tiver subscriber_id
-        flow_sent = None
+        # 3) Envia FLOW “em análise”
         if subscriber_id:
-            flow_sent = bc_send_flow(subscriber_id, BOTCONVERSA_FLOW_ANALISE)
-            log("📨 BotConversa flow(analise)", ok=flow_sent, flow_id=BOTCONVERSA_FLOW_ANALISE)
+            ok = bc_send_flow(subscriber_id, BOTCONVERSA_FLOW_ANALISE)
+            log("📨 BotConversa flow(analise)", ok=ok, flow_id=BOTCONVERSA_FLOW_ANALISE)
 
         # 4) Enfileira validação
         enqueue_validation_job(conn, member_id=member_id, email=email, nome=full_name, fonte="sbcp")
@@ -478,7 +437,6 @@ def webflow_webhook():
                 conn.close()
             except Exception:
                 pass
-
 
 # -------------------- Main (local) --------------------
 if __name__ == "__main__":
